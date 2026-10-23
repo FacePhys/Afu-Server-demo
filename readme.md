@@ -21,7 +21,8 @@
 4. 客户额度(含预支额度)用完时，服务端在ack中返回cap = 已确认，不再放行。
 5. cap不够开始一次测量时，SDK先发一次report拿最新的cap：有未确认的上报就重发它，没有就发计数不变、measurements为空的空上报。服务端对空上报不扣费。
 6. 上报失败重试时seq和明文内容不变，只重新加密；服务端收到已处理过的seq，直接按当前状态重新返回ack，不重复扣费。
-7. 服务端没有上报中的install_id时，会生成新的install_id并直接注册，在ack的install_id字段中返回；客户端发现ack中的install_id和自己的不同，就替换成新的，计数和seq接着用，不需要重新注册。
+7. 服务端换号：注册时install_id已存在(reason = conflict)，或上报时服务端没有该install_id(reason = unregistered)，服务端都会生成新的install_id并直接注册，返回refused，install_id字段就是新编号；客户端收到后直接替换成新编号，计数和seq接着用，不要再发register(会被再次换号)，下一次测量前按第5条拿cap。
+8. 唯一性只看install_id；app_key、app_id同一个客户的所有客户端都相同，不参与判断。
 
 ## 通用约定
 
@@ -29,18 +30,18 @@
 
 所有报文都走同一个入口，服务端根据外层的type字段分发处理。
 
-| 项目     | 取值                                            |
-| -------- | ----------------------------------------------- |
-| 地址     | `POST /v1/meter`                                |
-| 请求头   | `Content-Type: application/json; charset=utf-8` |
-| 请求type | register：注册；report：用量上报                |
-| 响应type | ack：成功；refused：业务拒绝                    |
+| 项目     | 取值                                               |
+| -------- | -------------------------------------------------- |
+| 地址     | `POST /v1/meter`                                   |
+| 请求头   | `Content-Type: application/json; charset=utf-8`    |
+| 请求type | register：注册；report：用量上报                   |
+| 响应type | ack：成功；refused：服务端已换号(编号冲突或未注册) |
 
-| 情况                         | http状态码 | 响应体                             |
-| ---------------------------- | ---------- | ---------------------------------- |
-| 成功(ack)或业务拒绝(refused) | 200        | 外层明文json，业务内容在加密的ct中 |
-| 协议错误                     | 400        | 明文json，不加密，见「错误响应」   |
-| 服务端内部错误               | 500        | 明文json，不加密，见「错误响应」   |
+| 情况           | http状态码 | 响应体                             |
+| -------------- | ---------- | ---------------------------------- |
+| ack或refused   | 200        | 外层明文json，业务内容在加密的ct中 |
+| 协议错误       | 400        | 明文json，不加密，见「错误响应」   |
+| 服务端内部错误 | 500        | 明文json，不加密，见「错误响应」   |
 
 请求体样例：
 
@@ -147,15 +148,15 @@
 
 > 明文字段描述(ct解密后)
 
-| 字段       | 说明                                                                                                                                                                            | 样例                             |
-| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
-| install_id | 安装编号：SDK 随机生成                                                                                                                                                          | ebedf529617fd42a433665cfd9150d46 |
-| app_key    | 我方发给客户的 App Key（阿福在 meter_open 时传入）                                                                                                                              | AK-demo                          |
-| app_id     | 包名或 Bundle ID，SDK 自己读取                                                                                                                                                  | com.example.app                  |
-| sdk        | sdk版本                                                                                                                                                                         | 1.1.0-beta.1                     |
-| platform   | 平台：android / ios                                                                                                                                                             | android                          |
-| reset      | 新安装的原因：空 = 第一次，corrupt = 文件损坏，unregistered = 上报时服务端没有该编号(服务端自动换号时记在安装记录里，客户端不会发送)，conflict = 注册时编号被拒(服务端暂不返回) | ""（第一次）                     |
-| ts         | 生成时间（Unix 毫秒）                                                                                                                                                           | 1792478738168                    |
+| 字段       | 说明                                                                                                                                                                                                          | 样例                             |
+| ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| install_id | 安装编号：SDK 随机生成                                                                                                                                                                                        | ebedf529617fd42a433665cfd9150d46 |
+| app_key    | 我方发给客户的 App Key（阿福在 meter_open 时传入）                                                                                                                                                            | AK-demo                          |
+| app_id     | 包名或 Bundle ID，SDK 自己读取                                                                                                                                                                                | com.example.app                  |
+| sdk        | sdk版本                                                                                                                                                                                                       | 1.1.0-beta.1                     |
+| platform   | 平台：android / ios                                                                                                                                                                                           | android                          |
+| reset      | 新安装的原因：空 = 第一次，corrupt = 文件损坏，unregistered = 上报时服务端没有该编号(服务端自动换号时记在安装记录里，客户端不会发送)，conflict = 注册时编号已存在(服务端换号时记在安装记录里，客户端不会发送) | ""（第一次）                     |
+| ts         | 生成时间（Unix 毫秒）                                                                                                                                                                                         | 1792478738168                    |
 
 明文样例：
 
@@ -175,7 +176,7 @@
 
 #### 过程描述
 
-根据结构体中的kid字段找到对应的rsa私钥，用这个私钥解密ek得到aes密钥，并对密文进行解密，得到明文json。解密失败等协议错误返回明文的http 400(见「错误响应」)。解密成功后，install_id不存在则注册相关的信息(入库)；已存在则视为客户端重试，不改数据。两种情况都返回ack。响应使用同一个aes密钥和新随机生成的iv加密。详细步骤见「服务端处理流程」。
+根据结构体中的kid字段找到对应的rsa私钥，用这个私钥解密ek得到aes密钥，并对密文进行解密，得到明文json。解密失败等协议错误返回明文的http 400(见「错误响应」)。解密成功后，install_id不存在则注册相关的信息(入库)并返回ack；已存在则生成新的install_id直接注册，返回refused(reason = conflict)，install_id为新编号。响应使用同一个aes密钥和新随机生成的iv加密。详细步骤见「服务端处理流程」。
 
 #### 字段描述
 
@@ -191,7 +192,7 @@
 
 | 字段       | 说明                                                                                 | 样例                             |
 | ---------- | ------------------------------------------------------------------------------------ | -------------------------------- |
-| install_id | 安装编号；和请求中的不同时，表示服务端已自动换号，客户端替换成这个新编号             | ebedf529617fd42a433665cfd9150d46 |
+| install_id | 安装编号                                                                             | ebedf529617fd42a433665cfd9150d46 |
 | seq        | 确认到第几份；回复注册时为 0                                                         | 1（回复注册时为 0）              |
 | cap_frames | 新的帧数上限 = 已确认的counters.frames_ok + 单次测量额度；额度用完时不加单次测量额度 | 300                              |
 | cap_runs   | 新的 run 上限 = 已确认的counters.run_ok + 单次测量额度；额度用完时不加单次测量额度   | 10                               |
@@ -213,22 +214,22 @@
 }
 ```
 
-> 明文字段描述(报文类型为refused时；注册和上报目前都不会返回refused，保留给后续的业务拒绝)
+> 明文字段描述(报文类型为refused时；目前只在服务端换号时出现)
 
-| 字段       | 说明                   | 样例                             |
-| ---------- | ---------------------- | -------------------------------- |
-| install_id | 安装编号：SDK 随机生成 | ebedf529617fd42a433665cfd9150d46 |
-| reason     | 拒绝原因，见下表       | unregistered                     |
+| 字段       | 说明                                         | 样例                             |
+| ---------- | -------------------------------------------- | -------------------------------- |
+| install_id | 安装编号：服务端新生成的编号，客户端直接替换 | 7c1e9a3b5d2f4e6a8b0c1d3e5f7a9b2c |
+| reason     | 拒绝原因，见下表                             | unregistered                     |
 
-| reason       | 出现场景 | 含义                                                                     | SDK处理                              |
-| ------------ | -------- | ------------------------------------------------------------------------ | ------------------------------------ |
-| conflict     | 暂不使用 | 保留值；当前重复注册一律按客户端重试返回ack，服务端不会返回              | 换新编号，以reset = conflict重新注册 |
-| unregistered | 暂不使用 | 保留值；服务端没有该编号时会自动注册新编号并在ack中返回，不再返回refused | 无                                   |
+| reason       | 出现场景 | 含义                                             | SDK处理                                                      |
+| ------------ | -------- | ------------------------------------------------ | ------------------------------------------------------------ |
+| conflict     | 注册     | install_id已被注册，服务端已生成新编号并直接注册 | 替换成refused中的install_id，不需要重新注册                  |
+| unregistered | 上报     | 服务端没有该编号，已生成新编号并直接注册         | 替换成refused中的install_id，计数和seq接着用，不需要重新注册 |
 
 明文样例：
 
 ```json
-{"install_id": "ebedf529617fd42a433665cfd9150d46", "reason": "unregistered"}
+{"install_id": "7c1e9a3b5d2f4e6a8b0c1d3e5f7a9b2c", "reason": "unregistered"}
 ```
 
 ### 客户端用量上报请求
@@ -304,11 +305,14 @@
 
 #### 过程描述
 
-和之前的解密方式一样，提取密文并进行解密，解密失败等协议错误返回明文的http 400(见「错误响应」)。如果服务端没有该install_id的注册记录，生成新的install_id，用上报中的app_key、app_id、platform直接注册，以本次counters作为已确认基线，在ack的install_id中返回新编号。如果seq已经处理过(客户端重试)，直接按当前状态重新返回ack，不重复扣费。否则对相关的数据进行入库存储，计算相关的视频时长，进行相关的扣费逻辑(空上报计数不变，不扣费)，如果客户的剩余额度到达了预警值，对客户进行通知，如果客户额度已经没有，就使用预支额度进行扣费(额度由商务进行决定)。然后根据用户是否还有剩余额度返回ack：还有额度时cap = 已确认 + 单次测量额度，额度(含预支)用完时cap = 已确认。详细步骤见「服务端处理流程」。
+和之前的解密方式一样，提取密文并进行解密，解密失败等协议错误返回明文的http 400(见「错误响应」)。如果服务端没有该install_id的注册记录，生成新的install_id，用上报中的app_key、app_id、platform直接注册，以本次counters作为已确认基线，返回refused(reason = unregistered)，install_id为新编号。如果seq已经处理过(客户端重试)，直接按当前状态重新返回ack，不重复扣费。否则对相关的数据进行入库存储，计算相关的视频时长，进行相关的扣费逻辑(空上报计数不变，不扣费)，如果客户的剩余额度到达了预警值，对客户进行通知，如果客户额度已经没有，就使用预支额度进行扣费(额度由商务进行决定)。然后根据用户是否还有剩余额度返回ack：还有额度时cap = 已确认 + 单次测量额度，额度(含预支)用完时cap = 已确认。详细步骤见「服务端处理流程」。
 
 #### 字段描述
 
-外层字段与注册响应相同，目前只会返回ack：明文字段和注册响应的ack完全相同，seq为已确认的最大上报序号；服务端自动换号时install_id为新编号。
+外层字段与注册响应相同：
+
+1. type为ack时：明文字段和注册响应的ack完全相同，seq为已确认的最大上报序号。
+2. type为refused时：reason为unregistered，install_id为服务端新生成的编号，明文字段和注册响应的refused相同。
 
 ## 服务端处理流程
 
@@ -324,8 +328,14 @@ sequenceDiagram
 
     Note over SDK: 首次使用，SDK随机生成install_id
     SDK->>S: register
-    S->>DB: 写入安装记录
-    S-->>SDK: ack(seq=0，cap=单次测量额度)
+    alt install_id未注册
+        S->>DB: 写入安装记录
+        S-->>SDK: ack(seq=0，cap=单次测量额度)
+    else install_id已注册
+        S->>DB: 生成新编号并直接注册
+        S-->>SDK: refused(conflict，install_id为新编号)
+        Note over SDK: 替换成新编号，之后发空上报拿cap
+    end
 
     loop 每次测量
         Note over SDK: 客户端自行校验网络
@@ -336,9 +346,14 @@ sequenceDiagram
         Note over SDK: 测量中，闸门按cap拦截
         alt 测量超过5秒
             SDK->>S: report(seq+1，累计counters，本次measurement)
-            S->>DB: 入库、扣费、更新已确认状态(不认识的install_id先自动注册新编号)
-            S-->>SDK: ack(新cap，换号时install_id为新编号)
-            Note over SDK: install_id和自己的不同就替换
+            alt 服务端有该install_id
+                S->>DB: 入库、扣费、更新已确认状态
+                S-->>SDK: ack(新cap)
+            else 服务端没有该install_id
+                S->>DB: 生成新编号并直接注册
+                S-->>SDK: refused(unregistered，install_id为新编号)
+                Note over SDK: 替换成新编号，计数和seq接着用
+            end
         else 5秒及以内
             Note over SDK: 不上报，不计入counters
         end
@@ -364,22 +379,27 @@ sequenceDiagram
 
 ### 注册处理
 
-1. 按install_id查安装记录。
-2. 不存在：
+> 唯一性只看install_id；app_key、app_id同一个客户的所有客户端都相同，不参与判断
+
+1. 按「原install_id」查：查到说明这个编号已经换过号(上次的refused丢了，客户端拿旧编号重试)，直接返回refused(reason = conflict，install_id = 这条记录的编号)。
+2. 按install_id查安装记录，不存在：
    1. 校验app_key、app_id(规则随计费细则同步，先留桩放行)。
    2. 写入安装记录，已确认seq = 0，已确认counters全为0。install_id唯一，并发写入冲突时按「已存在」处理。
    3. 按「cap计算」得到cap，返回ack(seq = 0)。
-3. 已存在：视为客户端重试(上次的ack丢了)，不比对app_key、app_id，不改数据，按当前状态返回ack。
+3. 已存在：
+   1. 生成新的install_id(32位小写hex随机数，与客户端生成的格式一致)。
+   2. 写入安装记录：原install_id = 请求中的编号，app_key、app_id、platform、sdk取自请求，reset = conflict，已确认seq = 0，已确认counters全为0。原install_id唯一，并发写入冲突时按第1步处理。
+   3. 返回refused(reason = conflict，install_id = 新编号)。
 
 ### 上报处理
 
-1. 按install_id查安装记录；查不到时再按「原install_id」查，查到说明已经换过号(上次的ack丢了，客户端拿旧编号重试)，后续使用查到的这条记录。
+1. 按install_id查安装记录；查不到时再按「原install_id」查，查到说明已经换过号(上次的refused丢了，客户端拿旧编号重试)，直接返回refused(reason = unregistered，install_id = 这条记录的编号)，不走后面的步骤。
 2. 都查不到：自动注册新编号，完成后直接返回，不走后面的步骤：
    1. 校验app_key、app_id(规则随计费细则同步，先留桩放行)。
    2. 生成新的install_id(32位小写hex随机数，与客户端生成的格式一致)。
    3. 写入安装记录：原install_id = 请求中的编号，app_key、app_id、platform、sdk取自本次上报，reset = unregistered，已确认seq = 本次seq，已确认counters = 本次counters(作为基线，历史用量不重复扣费)。原install_id唯一，并发写入冲突时按第1步查到处理。
    4. 保存本次上报和measurements；触发换号的这次测量是否计费随计费细则定(留桩)。
-   5. 按「cap计算」得到cap，返回ack(install_id = 新编号，seq = 本次seq)。
+   5. 返回refused(reason = unregistered，install_id = 新编号)。
 3. 对这条安装记录加锁(行锁或分布式锁，随技术栈定)并重新读取，同一个install_id的上报串行处理；第5步的入库和更新在同一个事务里完成。
 4. seq ≤ 已确认seq：重复上报(客户端重试或乱序到达)，不入库、不扣费，直接到第6步。
 5. seq > 已确认seq：
@@ -389,7 +409,7 @@ sequenceDiagram
    4. 按增量扣费、判断额度、使用预支额度(留桩)。
    5. 更新安装记录：已确认seq = 本次seq，已确认counters = 本次counters。
    6. 提交事务；需要预警时在事务外异步通知客户(留桩)。
-6. 按「cap计算」得到cap，返回ack(install_id = 这条记录的编号，seq = 已确认seq)。
+6. 按「cap计算」得到cap，返回ack(seq = 已确认seq)。
 
 ### cap计算
 
