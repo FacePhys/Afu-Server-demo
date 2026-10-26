@@ -21,7 +21,7 @@
 4. 客户额度(含预支额度)用完时，服务端在ack中返回cap = 已确认，不再放行。
 5. cap不够开始一次测量时，SDK先发一次report拿最新的cap：有未确认的上报就重发它，没有就发计数不变、measurements为空的空上报。服务端对空上报不扣费。
 6. 上报失败重试时seq和明文内容不变，只重新加密；服务端收到已处理过的seq，直接按当前状态重新返回ack，不重复扣费。
-7. 服务端换号：注册时install_id已存在(reason = conflict)，或上报时服务端没有该install_id(reason = unregistered)，服务端都会生成新的install_id并直接注册，返回refused，install_id字段就是新编号；客户端收到后直接替换成新编号，计数和seq接着用，不要再发register(会被再次换号)，下一次测量前按第5条拿cap。
+7. 服务端换号：注册时install_id已存在(reason = conflict)，或上报时服务端没有该install_id(reason = unregistered)，服务端都会生成新的install_id并直接注册，返回refused：install_id字段就是新编号，其余字段和ack一样带上seq和cap。客户端收到后把这次请求视为服务端已收到，不再重发；替换成新编号，直接按refused中的cap继续使用，不需要发空上报；计数和seq接着用，不要再发register(会被再次换号)。
 8. 唯一性只看install_id；app_key、app_id同一个客户的所有客户端都相同，不参与判断。
 
 ## 通用约定
@@ -176,7 +176,7 @@
 
 #### 过程描述
 
-根据结构体中的kid字段找到对应的rsa私钥，用这个私钥解密ek得到aes密钥，并对密文进行解密，得到明文json。解密失败等协议错误返回明文的http 400(见「错误响应」)。解密成功后，install_id不存在则注册相关的信息(入库)并返回ack；已存在则生成新的install_id直接注册，返回refused(reason = conflict)，install_id为新编号。响应使用同一个aes密钥和新随机生成的iv加密。详细步骤见「服务端处理流程」。
+根据结构体中的kid字段找到对应的rsa私钥，用这个私钥解密ek得到aes密钥，并对密文进行解密，得到明文json。解密失败等协议错误返回明文的http 400(见「错误响应」)。解密成功后，install_id不存在则注册相关的信息(入库)并返回ack；已存在则生成新的install_id直接注册，返回refused(reason = conflict)，install_id为新编号，并和ack一样带上seq和cap。响应使用同一个aes密钥和新随机生成的iv加密。详细步骤见「服务端处理流程」。
 
 #### 字段描述
 
@@ -216,20 +216,29 @@
 
 > 明文字段描述(报文类型为refused时；目前只在服务端换号时出现)
 
-| 字段       | 说明                                         | 样例                             |
-| ---------- | -------------------------------------------- | -------------------------------- |
-| install_id | 安装编号：服务端新生成的编号，客户端直接替换 | 7c1e9a3b5d2f4e6a8b0c1d3e5f7a9b2c |
-| reason     | 拒绝原因，见下表                             | unregistered                     |
+| 字段                                           | 说明                                         | 样例                             |
+| ---------------------------------------------- | -------------------------------------------- | -------------------------------- |
+| install_id                                     | 安装编号：服务端新生成的编号，客户端直接替换 | 7c1e9a3b5d2f4e6a8b0c1d3e5f7a9b2c |
+| reason                                         | 拒绝原因，见下表                             | unregistered                     |
+| seq、cap_frames、cap_runs、ttl_sec、report_sec | 和ack完全相同；客户端直接按这里的cap继续使用 | 同ack                            |
 
-| reason       | 出现场景 | 含义                                             | SDK处理                                                      |
-| ------------ | -------- | ------------------------------------------------ | ------------------------------------------------------------ |
-| conflict     | 注册     | install_id已被注册，服务端已生成新编号并直接注册 | 替换成refused中的install_id，不需要重新注册                  |
-| unregistered | 上报     | 服务端没有该编号，已生成新编号并直接注册         | 替换成refused中的install_id，计数和seq接着用，不需要重新注册 |
+| reason       | 出现场景 | 含义                                             | SDK处理                                                                                              |
+| ------------ | -------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
+| conflict     | 注册     | install_id已被注册，服务端已生成新编号并直接注册 | 替换成refused中的install_id，按refused中的cap继续使用，不需要重新注册                                |
+| unregistered | 上报     | 服务端没有该编号，已生成新编号并直接注册         | 这份上报视为已收到、不再重发；替换成refused中的install_id，按refused中的cap继续使用，计数和seq接着用 |
 
-明文样例：
+明文样例(回复上报，服务端换号)：
 
 ```json
-{"install_id": "7c1e9a3b5d2f4e6a8b0c1d3e5f7a9b2c", "reason": "unregistered"}
+{
+  "install_id": "7c1e9a3b5d2f4e6a8b0c1d3e5f7a9b2c",
+  "reason": "unregistered",
+  "seq": 1,
+  "cap_frames": 600,
+  "cap_runs": 20,
+  "ttl_sec": 86400,
+  "report_sec": 60
+}
 ```
 
 ### 客户端用量上报请求
@@ -305,14 +314,14 @@
 
 #### 过程描述
 
-和之前的解密方式一样，提取密文并进行解密，解密失败等协议错误返回明文的http 400(见「错误响应」)。如果服务端没有该install_id的注册记录，生成新的install_id，用上报中的app_key、app_id、platform直接注册，以本次counters作为已确认基线，返回refused(reason = unregistered)，install_id为新编号。如果seq已经处理过(客户端重试)，直接按当前状态重新返回ack，不重复扣费。否则对相关的数据进行入库存储，计算相关的视频时长，进行相关的扣费逻辑(空上报计数不变，不扣费)，如果客户的剩余额度到达了预警值，对客户进行通知，如果客户额度已经没有，就使用预支额度进行扣费(额度由商务进行决定)。然后根据用户是否还有剩余额度返回ack：还有额度时cap = 已确认 + 单次测量额度，额度(含预支)用完时cap = 已确认。详细步骤见「服务端处理流程」。
+和之前的解密方式一样，提取密文并进行解密，解密失败等协议错误返回明文的http 400(见「错误响应」)。如果服务端没有该install_id的注册记录，生成新的install_id，用上报中的app_key、app_id、platform直接注册，以本次counters作为已确认基线，返回refused(reason = unregistered)，install_id为新编号，并和ack一样带上seq和cap。如果seq已经处理过(客户端重试)，直接按当前状态重新返回ack，不重复扣费。否则对相关的数据进行入库存储，计算相关的视频时长，进行相关的扣费逻辑(空上报计数不变，不扣费)，如果客户的剩余额度到达了预警值，对客户进行通知，如果客户额度已经没有，就使用预支额度进行扣费(额度由商务进行决定)。然后根据用户是否还有剩余额度返回ack：还有额度时cap = 已确认 + 单次测量额度，额度(含预支)用完时cap = 已确认。详细步骤见「服务端处理流程」。
 
 #### 字段描述
 
 外层字段与注册响应相同：
 
 1. type为ack时：明文字段和注册响应的ack完全相同，seq为已确认的最大上报序号。
-2. type为refused时：reason为unregistered，install_id为服务端新生成的编号，明文字段和注册响应的refused相同。
+2. type为refused时：reason为unregistered，install_id为服务端新生成的编号，seq为本次上报的序号，明文字段和注册响应的refused相同。
 
 ## 服务端处理流程
 
@@ -333,8 +342,8 @@ sequenceDiagram
         S-->>SDK: ack(seq=0，cap=单次测量额度)
     else install_id已注册
         S->>DB: 生成新编号并直接注册
-        S-->>SDK: refused(conflict，install_id为新编号)
-        Note over SDK: 替换成新编号，之后发空上报拿cap
+        S-->>SDK: refused(conflict，新编号，cap)
+        Note over SDK: 替换成新编号，按refused中的cap继续
     end
 
     loop 每次测量
@@ -351,8 +360,8 @@ sequenceDiagram
                 S-->>SDK: ack(新cap)
             else 服务端没有该install_id
                 S->>DB: 生成新编号并直接注册
-                S-->>SDK: refused(unregistered，install_id为新编号)
-                Note over SDK: 替换成新编号，计数和seq接着用
+                S-->>SDK: refused(unregistered，新编号，cap)
+                Note over SDK: 这份上报视为已收到，替换成新编号，按refused中的cap继续
             end
         else 5秒及以内
             Note over SDK: 不上报，不计入counters
@@ -381,33 +390,32 @@ sequenceDiagram
 
 > 唯一性只看install_id；app_key、app_id同一个客户的所有客户端都相同，不参与判断
 
-1. 按「原install_id」查：查到说明这个编号已经换过号(上次的refused丢了，客户端拿旧编号重试)，直接返回refused(reason = conflict，install_id = 这条记录的编号)。
-2. 按install_id查安装记录，不存在：
+1. 按install_id查安装记录，不存在：
    1. 校验app_key、app_id(规则随计费细则同步，先留桩放行)。
    2. 写入安装记录，已确认seq = 0，已确认counters全为0。install_id唯一，并发写入冲突时按「已存在」处理。
    3. 按「cap计算」得到cap，返回ack(seq = 0)。
-3. 已存在：
+2. 已存在(换号时不记录旧编号；refused丢失时客户端拿旧编号重试，会再换一次号，上一次换出的记录不再使用)：
    1. 生成新的install_id(32位小写hex随机数，与客户端生成的格式一致)。
-   2. 写入安装记录：原install_id = 请求中的编号，app_key、app_id、platform、sdk取自请求，reset = conflict，已确认seq = 0，已确认counters全为0。原install_id唯一，并发写入冲突时按第1步处理。
-   3. 返回refused(reason = conflict，install_id = 新编号)。
+   2. 写入安装记录：app_key、app_id、platform、sdk取自请求，reset = conflict，已确认seq = 0，已确认counters全为0。
+   3. 按「cap计算」得到cap，返回refused(reason = conflict，install_id = 新编号，seq = 0)。
 
 ### 上报处理
 
-1. 按install_id查安装记录；查不到时再按「原install_id」查，查到说明已经换过号(上次的refused丢了，客户端拿旧编号重试)，直接返回refused(reason = unregistered，install_id = 这条记录的编号)，不走后面的步骤。
-2. 都查不到：自动注册新编号，完成后直接返回，不走后面的步骤：
+1. 按install_id查安装记录。
+2. 查不到：自动注册新编号，完成后直接返回，不走后面的步骤(换号时不记录旧编号；refused丢失时客户端拿旧编号重试，会再换一次号，上一次换出的记录不再使用)：
    1. 校验app_key、app_id(规则随计费细则同步，先留桩放行)。
    2. 生成新的install_id(32位小写hex随机数，与客户端生成的格式一致)。
-   3. 写入安装记录：原install_id = 请求中的编号，app_key、app_id、platform、sdk取自本次上报，reset = unregistered，已确认seq = 本次seq，已确认counters = 本次counters(作为基线，历史用量不重复扣费)。原install_id唯一，并发写入冲突时按第1步查到处理。
-   4. 保存本次上报和measurements；触发换号的这次测量是否计费随计费细则定(留桩)。
-   5. 返回refused(reason = unregistered，install_id = 新编号)。
+   3. 写入安装记录：app_key、app_id、platform、sdk取自本次上报，reset = unregistered，已确认seq = 本次seq，已确认counters = 本次counters(作为基线，历史用量不重复扣费)。
+   4. 保存本次上报和measurements；触发换号的这次测量是否计费随计费细则定(留桩)；如果计费，refused丢失重试再换号时会再扣一次。
+   5. 按「cap计算」得到cap，返回refused(reason = unregistered，install_id = 新编号，seq = 本次seq)。
 3. 对这条安装记录加锁(行锁或分布式锁，随技术栈定)并重新读取，同一个install_id的上报串行处理；第5步的入库和更新在同一个事务里完成。
 4. seq ≤ 已确认seq：重复上报(客户端重试或乱序到达)，不入库、不扣费，直接到第6步。
 5. seq > 已确认seq：
    1. 保存原始上报明文(install_id + seq唯一)，用于对账和审计。
    2. 保存measurements(install_id + no唯一，重复的no忽略)。
-   3. 计算增量 = 本次counters - 已确认counters；空上报增量为0；增量为负时按0处理并记录异常(暂定)。
+   3. 计算增量 = 本次counters - 已确认counters(每一项分别算)；空上报增量为0；某一项增量为负时该项按0处理并记录异常。
    4. 按增量扣费、判断额度、使用预支额度(留桩)。
-   5. 更新安装记录：已确认seq = 本次seq，已确认counters = 本次counters。
+   5. 更新安装记录：已确认seq = 本次seq；已确认counters每一项取max(已确认值, 本次值)，只增不减，避免计数变小后把已扣过的用量再扣一次。
    6. 提交事务；需要预警时在事务外异步通知客户(留桩)。
 6. 按「cap计算」得到cap，返回ack(seq = 已确认seq)。
 
@@ -420,10 +428,10 @@ sequenceDiagram
 
 ### 数据实体(逻辑模型)
 
-| 实体                 | 主要字段                                                                                                                               | 说明                                 |
-| -------------------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| rsa密钥              | kid、私钥、状态(启用 / 下线)                                                                                                           | 私钥放配置或密钥管理服务，不放业务库 |
-| 安装记录             | install_id(唯一)、原install_id(换号时记录，唯一)、app_key、app_id、platform、sdk、reset、注册时间、已确认seq、已确认counters、更新时间 | 每个install一条                      |
-| 上报记录             | install_id + seq(唯一)、ts、原始明文json、接收时间                                                                                     | 对账、审计                           |
-| 测量记录             | install_id + no(唯一)、start_ts、end_ts、frames、dt_ms                                                                                 | 单次测量明细                         |
-| 客户、额度、扣费流水 | 随计费细则同步                                                                                                                         | 留桩                                 |
+| 实体                 | 主要字段                                                                                               | 说明                                 |
+| -------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------ |
+| rsa密钥              | kid、私钥、状态(启用 / 下线)                                                                           | 私钥放配置或密钥管理服务，不放业务库 |
+| 安装记录             | install_id(唯一)、app_key、app_id、platform、sdk、reset、注册时间、已确认seq、已确认counters、更新时间 | 每个install一条                      |
+| 上报记录             | install_id + seq(唯一)、ts、原始明文json、接收时间                                                     | 对账、审计                           |
+| 测量记录             | install_id + no(唯一)、start_ts、end_ts、frames、dt_ms                                                 | 单次测量明细                         |
+| 客户、额度、扣费流水 | 随计费细则同步                                                                                         | 留桩                                 |
