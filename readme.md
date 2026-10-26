@@ -32,7 +32,7 @@
 
 | 项目     | 取值                                               |
 | -------- | -------------------------------------------------- |
-| 地址     | `POST /v1/meter`                                   |
+| 地址     | `POST /afu/v1/meter`                               |
 | 请求头   | `Content-Type: application/json; charset=utf-8`    |
 | 请求type | register：注册；report：用量上报                   |
 | 响应type | ack：成功；refused：服务端已换号(编号冲突或未注册) |
@@ -373,7 +373,7 @@ sequenceDiagram
 
 ### 通用处理(所有请求)
 
-1. 接收 `POST /v1/meter`，请求体超过大小上限(如64KB)直接拒绝。
+1. 接收 `POST /afu/v1/meter`，请求体超过大小上限(如64KB)直接拒绝。
 2. 解析外层json，校验v、kid、type、ct是否存在、类型是否正确，失败返回bad_request。
 3. v不支持返回unsupported_version；type不是register / report返回unknown_type。
 4. 按kid取rsa私钥，不存在返回unknown_kid。

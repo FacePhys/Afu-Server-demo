@@ -1,0 +1,11 @@
+# 私钥与本地配置不提交
+keys/
+configs/config.yaml
+
+# 构建产物
+bin/
+
+# 前端：依赖和构建产物不提交，dist 只保留占位文件
+web/node_modules/
+web/dist/*
+!web/dist/.keep

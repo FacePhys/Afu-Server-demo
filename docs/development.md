@@ -4,16 +4,16 @@
 
 ## 技术选型
 
-| 项目       | 选型                                                              | 说明                                                                            |
-| ---------- | ----------------------------------------------------------------- | ------------------------------------------------------------------------------- |
-| 语言       | Go 1.27                                                           | 最低要求 1.24(用到 `cipher.NewGCMWithRandomNonce`)                              |
-| http框架   | Gin                                                               | 只有一个路由 `POST /v1/meter`                                                   |
-| 数据库     | MySQL 8(InnoDB，utf8mb4)                                          | 需要事务和行锁(`SELECT ... FOR UPDATE`)                                         |
-| 数据库访问 | GORM(`gorm.io/gorm` + `gorm.io/driver/mysql`)                     | 建表仍用SQL文件，不用AutoMigrate；锁和冲突处理显式写Clauses，见「GORM使用约定」 |
-| 加解密     | 标准库 `crypto/rsa`、`crypto/aes`、`crypto/cipher`、`crypto/rand` | 不引入第三方加密库                                                              |
-| 配置       | YAML(`gopkg.in/yaml.v3`)，数据库连接串可用环境变量覆盖            |                                                                                 |
-| 日志       | 标准库 `log/slog`，JSON输出                                       |                                                                                 |
-| 测试       | 标准库 `testing` + `net/http/httptest`；集成测试连本地MySQL       |                                                                                 |
+| 项目       | 选型                                                              | 说明                                                                                |
+| ---------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
+| 语言       | Go 1.27                                                           | 最低要求 1.25(Gin v1.12等依赖要求；代码用到 1.24 的 `cipher.NewGCMWithRandomNonce`) |
+| http框架   | Gin                                                               | 只有一个路由 `POST /afu/v1/meter`                                                   |
+| 数据库     | MySQL 8(InnoDB，utf8mb4)                                          | 需要事务和行锁(`SELECT ... FOR UPDATE`)                                             |
+| 数据库访问 | GORM(`gorm.io/gorm` + `gorm.io/driver/mysql`)                     | 建表仍用SQL文件，不用AutoMigrate；锁和冲突处理显式写Clauses，见「GORM使用约定」     |
+| 加解密     | 标准库 `crypto/rsa`、`crypto/aes`、`crypto/cipher`、`crypto/rand` | 不引入第三方加密库                                                                  |
+| 配置       | YAML(`gopkg.in/yaml.v3`)，数据库连接串可用环境变量覆盖            |                                                                                     |
+| 日志       | 标准库 `log/slog`，JSON输出                                       |                                                                                     |
+| 测试       | 标准库 `testing` + `net/http/httptest`；集成测试连本地MySQL       |                                                                                     |
 
 ## 目录结构
 
@@ -30,7 +30,9 @@
 │   ├── handler/              # Gin路由、「通用处理」10步
 │   ├── service/              # 注册处理、上报处理、换号、cap计算、install_id生成
 │   ├── billing/              # 计费接口 + 留桩实现
-│   └── store/                # MySQL读写
+│   ├── store/                # MySQL读写
+│   └── console/              # 内部数据后台的只读接口，见 docs/internal-console.md
+├── web/                      # 内部数据后台前端(React + Ant Design)，构建产物打进二进制
 ├── migrations/001_init.sql   # 建表
 ├── configs/config.example.yaml
 ├── keys/                     # 本地私钥，不提交
@@ -76,10 +78,10 @@ log:
 
 ## 数据库
 
-`migrations/001_init.sql`：
+`migrations/001_init.sql`(用 `IF NOT EXISTS`，重复执行不报错，集成测试也直接执行它建表)：
 
 ```sql
-CREATE TABLE installs (
+CREATE TABLE IF NOT EXISTS installs (
   id              BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   install_id      CHAR(32)        NOT NULL,
   app_key         VARCHAR(64)     NOT NULL,
@@ -101,7 +103,7 @@ CREATE TABLE installs (
   KEY idx_app_key (app_key)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE reports (
+CREATE TABLE IF NOT EXISTS reports (
   id           BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   install_id   CHAR(32)        NOT NULL,              -- 换号时记新编号
   seq          BIGINT UNSIGNED NOT NULL,
@@ -111,7 +113,7 @@ CREATE TABLE reports (
   UNIQUE KEY uk_install_seq (install_id, seq)
 ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
 
-CREATE TABLE measurements (
+CREATE TABLE IF NOT EXISTS measurements (
   id          BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
   install_id  CHAR(32)        NOT NULL,
   measure_no  BIGINT UNSIGNED NOT NULL,               -- 对应 measurements[].no
@@ -149,12 +151,13 @@ CREATE TABLE measurements (
 db, err := gorm.Open(mysql.Open(cfg.DB.DSN), &gorm.Config{
 	TranslateError:         true, // 1062 → gorm.ErrDuplicatedKey
 	SkipDefaultTransaction: true, // 单条写入不自动包事务，需要事务的地方显式写
-	Logger: logger.New(slogWriter, logger.Config{
+	// ignoreDuplicateKey 包一层：注册时编号已存在是换号的正常分支，唯一键冲突不记错误日志
+	Logger: ignoreDuplicateKey{logger.New(slogWriter, logger.Config{
 		SlowThreshold:             200 * time.Millisecond,
 		IgnoreRecordNotFoundError: true, // 查不到安装记录是正常分支，不打错误日志
 		ParameterizedQueries:      true, // 日志里不带参数值
 		LogLevel:                  logger.Warn,
-	}),
+	})},
 })
 ```
 
@@ -300,7 +303,7 @@ type Refused struct {
 | 字段                 | 规则                                                                      |
 | -------------------- | ------------------------------------------------------------------------- |
 | install_id           | 32位小写hex                                                               |
-| app_key、app_id、sdk | 非空；上报也必填(自动注册要用)                                            |
+| app_key、app_id、sdk | 非空，长度不超过列宽(64 / 255 / 32)；上报也必填(自动注册要用)             |
 | platform             | android / ios                                                             |
 | reset                | 空、corrupt、conflict、unregistered之一(后两个客户端不会发，收到也不拒绝) |
 | ts                   | 大于0                                                                     |
@@ -389,6 +392,8 @@ func SealResponse(aesKey []byte, v int, typ string, plain []byte) (string, error
 1. aes密钥只在本次请求的函数栈里传递，不进日志、不进数据库、不放进context。
 2. 不要自己实现「先生成iv再Seal」，统一用 `NewGCMWithRandomNonce`，避免有人误用请求的iv。
 
+`internal/envelope/client.go` 另外提供客户端一侧的 `SealRequest`、`OpenResponse`，给 `cmd/fakeclient` 和测试模拟SDK用，服务端不调用。
+
 ### 密钥生成
 
 ```bash
@@ -407,7 +412,7 @@ openssl rsa -in keys/kid1.pem -RSAPublicKey_out -out keys/kid1.pkcs1.pub.pem
 1. `gin.New()`，不用 `gin.Default()`：自己挂两个中间件。
    1. recovery：panic时返回500 `internal_error`，记录堆栈。
    2. 访问日志(slog)：记录type、kid、install_id、seq、响应type或错误code、耗时；不记ct、明文、aes密钥。
-2. 只注册 `POST /v1/meter`。
+2. 只注册 `POST /afu/v1/meter`。
 3. 生产环境 `gin.SetMode(gin.ReleaseMode)`；没有前置代理时 `r.SetTrustedProxies(nil)`。
 4. 请求体用 `http.MaxBytesReader` 限制大小；超限暂按 bad_request 返回(readme未定义，见「待定」)。
 5. 不要用 `c.BindJSON`：它解析失败会自己写400和纯文本响应，格式和错误码对不上。统一用 `json.NewDecoder` 解析，自己返回错误。
@@ -498,7 +503,8 @@ func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (strin
 
 	inst := store.Install{InstallID: req.InstallID, AppKey: req.AppKey, AppID: req.AppID,
 		Platform: req.Platform, SDK: req.SDK, ResetReason: req.Reset}
-	err = s.db.WithContext(ctx).Create(&inst).Error
+	db := s.db.WithContext(ctx)
+	err = db.Create(&inst).Error
 	if err == nil {
 		return protocol.TypeAck, s.ack(inst.InstallID, 0, protocol.Counters{}, hasQuota), nil
 	}
@@ -508,9 +514,8 @@ func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (strin
 
 	// 已存在：换号，不记录旧编号
 	newInst := inst
-	newInst.ID = 0
-	newInst.InstallID, newInst.ResetReason = s.newInstallID(), protocol.ReasonConflict
-	if err := s.db.WithContext(ctx).Create(&newInst).Error; err != nil {
+	newInst.ResetReason = protocol.ReasonConflict
+	if err := s.createWithNewID(db, &newInst); err != nil { // 生成新编号插入，撞上唯一键就重新生成
 		return "", nil, err
 	}
 	return protocol.TypeRefused, protocol.Refused{
@@ -665,21 +670,21 @@ services:
       MYSQL_USER: afu
       MYSQL_PASSWORD: afu
     ports:
-      - "3306:3306"
+      - "${AFU_MYSQL_PORT:-3306}:3306"   # 本机3306被占用时: AFU_MYSQL_PORT=3307 make db
     volumes:
       - ./migrations:/docker-entrypoint-initdb.d:ro   # 首次启动自动建表
 ```
 
 `Makefile` 目标：
 
-| 目标         | 作用                                              |
-| ------------ | ------------------------------------------------- |
-| `make db`    | `docker compose up -d mysql`                      |
-| `make keys`  | 按「密钥生成」生成kid1的私钥和两种公钥            |
-| `make run`   | `go run ./cmd/server -config configs/config.yaml` |
-| `make test`  | `go test ./...`(不连数据库)                       |
-| `make itest` | 设置 `AFU_TEST_DSN` 后跑集成测试                  |
-| `make lint`  | `go vet ./...`                                    |
+| 目标         | 作用                                                                                               |
+| ------------ | -------------------------------------------------------------------------------------------------- |
+| `make db`    | `docker compose up -d mysql`                                                                       |
+| `make keys`  | 按「密钥生成」生成kid1的私钥和两种公钥；`keys/kid1.pem` 已存在时不覆盖，避免已发给客户端的公钥失效 |
+| `make run`   | `go run ./cmd/server -config configs/config.yaml`                                                  |
+| `make test`  | `go test ./...`(不连数据库)                                                                        |
+| `make itest` | 设置 `AFU_TEST_DSN` 后跑集成测试                                                                   |
+| `make lint`  | `go vet ./...`                                                                                     |
 
 ## 测试
 
@@ -696,6 +701,8 @@ services:
 
 ### 集成测试(连本地MySQL，没设 `AFU_TEST_DSN` 就跳过)
 
+> 测试会清空 installs、reports、measurements 三张表，`AFU_TEST_DSN` 必须指向专用测试库。
+
 | 场景                   | 期望                                              |
 | ---------------------- | ------------------------------------------------- |
 | 新install_id注册       | ack，seq = 0，cap = 单次测量额度                  |
@@ -710,7 +717,7 @@ services:
 
 ### 端到端
 
-`cmd/fakeclient` 用测试公钥模拟SDK：注册 → 上报 → 重复上报 → 换号，逐步打印解密后的响应。客户端联调前先用它跑通，SDK同学可以对照它的报文排查问题。
+`cmd/fakeclient` 用测试公钥模拟SDK：注册 → 上报(`-reports N` 次，默认1) → 重复上报 → 空上报 → 重复注册换号 → 未知编号上报换号，逐步打印解密后的响应。客户端联调前先用它跑通，SDK同学可以对照它的报文排查问题。
 
 ## 开发顺序
 
