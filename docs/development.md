@@ -29,7 +29,7 @@
 │   ├── protocol/             # 报文结构体、字段校验、错误码、类型常量
 │   ├── handler/              # Gin路由、「通用处理」10步
 │   ├── service/              # 注册处理、上报处理、换号、cap计算、install_id生成
-│   ├── billing/              # 计费接口 + 留桩实现
+│   ├── billing/              # 计费接口：KeyBilling 按次计费(单价 × 新增测量次数，从余额扣)，其余规则留桩
 │   ├── store/                # MySQL读写
 │   └── console/              # 内部数据后台的只读接口，见 docs/internal-console.md
 ├── web/                      # 内部数据后台前端(React + Ant Design)，构建产物打进二进制
@@ -130,7 +130,7 @@ CREATE TABLE IF NOT EXISTS measurements (
 ```
 
 1. 列名避开MySQL关键字：`reset` → `reset_reason`，`no` → `measure_no`。
-2. App Key 表在 `migrations/002_app_keys.sql`(app_key 列用 utf8mb4_bin，区分大小写)，由内部后台生成或导入。
+2. App Key 表在 `migrations/002_app_keys.sql`(app_key 列用 utf8mb4_bin，区分大小写)，由内部后台生成或导入；`003_billing.sql` 加了单价 `unit_price`、余额 `balance`、透支额度 `overdraft_limit`、累计计费次数 `used_count` 和计费流水表 `billing_ledger`；金额一律用整数，单位 0.0001 元。
 3. 客户、额度、扣费流水的表等计费细则同步后再设计，现在不建。
 3. 写measurements要忽略重复的no：`Clauses(clause.OnConflict{DoNothing: true})`，在MySQL下生成 `ON DUPLICATE KEY UPDATE id=id`。不要用 `INSERT IGNORE`，它会把截断等其他错误也吞掉。
 4. 唯一键冲突判断：开启 `TranslateError` 后用 `errors.Is(err, gorm.ErrDuplicatedKey)`，驱动会把MySQL错误码1062转换成它。
@@ -582,7 +582,8 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 		if regressed {
 			s.log.Warn("counters regressed", "install_id", inst.InstallID, "seq", req.Seq)
 		}
-		charge, err := s.billing.Charge(ctx, tx, inst.AppKey, delta) // 留桩
+		charge, err := s.billing.Charge(ctx, tx, billing.ChargeRequest{ // 按新增测量次数扣费、判断额度
+			AppKey: req.AppKey, InstallID: inst.InstallID, Seq: req.Seq, Delta: delta})
 		if err != nil {
 			return err
 		}
@@ -639,19 +640,19 @@ func (s *Service) ack(installID string, seq uint64, c protocol.Counters, hasQuot
 }
 ```
 
-## 计费留桩(internal/billing)
+## 计费(internal/billing)
 
 ```go
 type ChargeResult struct {
-	HasQuota bool // 扣费后客户是否还有额度(含预支)
+	HasQuota bool // 扣费后余额 + 透支额度还够不够付下一次
 	Warn     bool // 是否需要发送额度预警
 }
 
 type Billing interface {
 	ValidateApp(ctx context.Context, appKey, appID string) error
 	HasQuota(ctx context.Context, appKey string) (bool, error)
-	// Charge 在上报事务内调用，按增量扣费
-	Charge(ctx context.Context, tx *gorm.DB, appKey string, delta protocol.Counters) (ChargeResult, error)
+	// Charge 在上报事务内调用，按增量扣费；req 带 App Key、install_id、seq 和计数增量
+	Charge(ctx context.Context, tx *gorm.DB, req ChargeRequest) (ChargeResult, error)
 	// OnReassign 上报换号时调用，决定触发换号的这次测量是否计费
 	OnReassign(ctx context.Context, tx *gorm.DB, appKey string, m []protocol.Measurement) error
 }
@@ -661,7 +662,16 @@ type Notifier interface {
 }
 ```
 
-现在提供 `billing.Noop`：全部放行、永远有额度、不扣费、不预警；`Notifier` 只打日志。计费细则同步后只替换这两个实现，service层不用改。
+服务启动用 `billing.KeyBilling`，按次计费：
+
+1. 金额一律用整数，单位 0.0001 元(`store.MoneyUnitsPerYuan` = 10000)，避免小数误差。
+2. 扣费：`Charge` 在上报事务里先 `FOR UPDATE` 锁住这个 App Key 的行，余额减去 `delta.Sessions × unit_price`，`used_count += delta.Sessions`，再记一条扣费流水(install_id、seq、次数、单价、扣后余额)。同一个 App Key 的扣费串行，加锁顺序固定为「安装记录 → App Key」，不会死锁。
+3. 额度：单价为0不收费(照常计次、记流水)；`balance + overdraft_limit ≥ unit_price` 时还发额度，否则停发(ack 的 cap 等于已确认值)。按发出去的额度扣，不会扣穿透支额度。
+4. 计费状态：`free` 不收费、`normal` 余额不为负、`overdraft` 余额为负但还够付一次、`exhausted` 停发。进入 `overdraft` 或 `exhausted` 时 `ChargeResult.Warn` 为 true，`LogNotifier` 记一条 `quota warning` 日志。
+5. 重复上报、空上报、计数变小时增量为0，不扣费；上报换号时以本次计数为基线，触发换号的这次测量不扣费。
+6. 允许少量超出：额度是在发 ack 时判断的，停发之前已经拿到额度的设备还能各测一次，所以余额最多超出透支额度「当时手里还有额度的设备数 × 单价」。
+7. 余额只能通过充值(内部后台)和上报扣费变化，按 id 顺序累加流水金额等于当前余额。
+8. `ValidateApp`、`OnReassign` 仍用 `Noop` 的留桩实现；计费细则同步后在 `KeyBilling` 上扩展，service层不用改。
 
 ## 本地开发
 
@@ -712,18 +722,19 @@ services:
 
 > 测试会清空 installs、reports、measurements 三张表，`AFU_TEST_DSN` 必须指向专用测试库。
 
-| 场景                               | 期望                                              |
-| ---------------------------------- | ------------------------------------------------- |
-| app_key 不存在、已停用、大小写不同 | 403 invalid_app_key，不入库、不扣费               |
-| 新install_id注册                   | ack，seq = 0，cap = 单次测量额度                  |
-| 已存在的install_id注册             | refused(conflict)，install_id为新编号且已入库     |
-| 正常上报                           | ack，已确认seq和counters更新                      |
-| 重复seq                            | ack，不新增reports行，不调用Charge                |
-| 计数变小                           | 已确认counters不变，增量按0，记录异常日志         |
-| 空上报                             | ack，增量为0                                      |
-| 未知install_id上报                 | refused(unregistered)，新记录以本次counters为基线 |
-| 同一install_id并发上报             | 串行处理，只扣一次                                |
-| 桩切成「无额度」                   | cap = 已确认counters                              |
+| 场景                                           | 期望                                                                                                                              |
+| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
+| app_key 不存在、已停用、大小写不同             | 403 invalid_app_key，不入库、不扣费                                                                                               |
+| 新install_id注册                               | ack，seq = 0，cap = 单次测量额度                                                                                                  |
+| 已存在的install_id注册                         | refused(conflict)，install_id为新编号且已入库                                                                                     |
+| 正常上报                                       | ack，已确认seq和counters更新                                                                                                      |
+| 重复seq                                        | ack，不新增reports行，不调用Charge                                                                                                |
+| 计数变小                                       | 已确认counters不变，增量按0，记录异常日志                                                                                         |
+| 空上报                                         | ack，增量为0                                                                                                                      |
+| 未知install_id上报                             | refused(unregistered)，新记录以本次counters为基线                                                                                 |
+| 同一install_id并发上报                         | 串行处理，只扣一次                                                                                                                |
+| App Key 单价0.50元、余额1.00元、透支额度1.00元 | 余额依次0.50 → 0 → −0.50(透支) → −1.00(停发，cap = 已确认)；重复上报、空上报不扣费；每笔扣费一条流水；停发后注册 cap = 0；预警2次 |
+| 20台设备并发上报同一个 App Key(单价0.01元)     | 余额正好少0.20元，流水合计−0.20元，计费次数20                                                                                     |
 
 ### 端到端
 
@@ -743,7 +754,7 @@ services:
 
 ## 待定
 
-1. 计费细则：计费单位、单次测量额度的值、客户与额度数据、预警通知渠道、app_key校验不通过时的响应。代码里先走 `billing.Noop`。
+1. 计费细则：单次测量额度的值、客户与App Key的关系、预警通知渠道。按次计费(单价、余额、透支额度、充值、流水)已实现(`billing.KeyBilling`)，其余规则待同步。
 2. 请求体超限的错误码：readme未定义，暂按bad_request实现。
 3. ttl_sec、report_sec的语义：暂取配置值原样下发。
 4. 部署：https在服务里终止还是由前置负载均衡处理；阿福转发阶段的身份认证；限流。

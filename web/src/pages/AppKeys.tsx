@@ -1,31 +1,145 @@
 import { useState } from 'react'
-import { Alert, App, Button, Flex, Form, Input, Modal, Popconfirm, Table, Tag, Typography, type TableColumnsType } from 'antd'
+import {
+  Alert,
+  App,
+  Button,
+  Drawer,
+  Flex,
+  Form,
+  Input,
+  InputNumber,
+  Modal,
+  Popconfirm,
+  Space,
+  Table,
+  Tag,
+  Typography,
+  type TableColumnsType,
+} from 'antd'
 import { PlusOutlined } from '@ant-design/icons'
+import { Link } from 'react-router'
 import { apiGet, apiSend, errorText } from '../api/client'
-import type { AppKey, AppKeyList } from '../api/types'
+import type { AppKey, AppKeyList, LedgerEntry, Page } from '../api/types'
 import { useApi } from '../api/useApi'
+import CursorTable from '../components/CursorTable'
+import { IdText } from '../components/Common'
+import { fmtNum } from '../utils/format'
+import { fmtYuan, unitsToYuan, yuanToUnits } from '../utils/money'
 import { fmtTime } from '../utils/time'
 
 interface CreateForm {
   remark?: string
   app_key?: string
+  unit_price?: number | null
+  initial_balance?: number | null
+  overdraft_limit?: number | null
 }
 
-// AppKeys App Key 管理：生成(或导入已发给客户的)、停用 / 启用。注册、上报只认已启用的 App Key。
+interface PriceForm {
+  unit_price?: number | null
+  overdraft_limit?: number | null
+}
+
+interface RechargeForm {
+  amount?: number | null
+  remark?: string
+}
+
+const BILLING_TAG: Record<AppKey['billing_state'], { color?: string; text: string }> = {
+  free: { text: '不收费' },
+  normal: { color: 'green', text: '正常' },
+  overdraft: { color: 'orange', text: '透支中' },
+  exhausted: { color: 'red', text: '已停发' },
+}
+
+const yuanInput = { min: 0, precision: 4, style: { width: '100%' }, suffix: '元' }
+
+/** 单价、透支额度两个输入框，创建和修改定价共用 */
+function PriceFields() {
+  return (
+    <>
+      <Form.Item name="unit_price" label="单价(每次测量)" extra="每次上报按「新增测量次数 × 单价」从余额扣；留空或填 0 表示不收费。">
+        <InputNumber {...yuanInput} placeholder="0" />
+      </Form.Item>
+      <Form.Item
+        name="overdraft_limit"
+        label="透支额度"
+        extra="余额可以扣到负数，最多透支这么多；余额加透支额度不够付下一次时停发额度，SDK 不能再开始新测量。"
+      >
+        <InputNumber {...yuanInput} placeholder="0" />
+      </Form.Item>
+    </>
+  )
+}
+
+/** 计费流水：扣费、充值，新的在前 */
+function LedgerDrawer({ k, onClose }: { k: AppKey; onClose: () => void }) {
+  const columns: TableColumnsType<LedgerEntry> = [
+    { title: '时间', dataIndex: 'created_at', render: fmtTime },
+    {
+      title: '类型',
+      dataIndex: 'kind',
+      render: (v: LedgerEntry['kind']) => (v === 'recharge' ? <Tag color="green">充值</Tag> : <Tag>扣费</Tag>),
+    },
+    {
+      title: '金额(元)',
+      dataIndex: 'amount',
+      align: 'right',
+      render: (v: number) => <span style={{ color: v > 0 ? '#389e0d' : undefined }}>{v > 0 ? `+${fmtYuan(v)}` : fmtYuan(v)}</span>,
+    },
+    { title: '变动后余额(元)', dataIndex: 'balance_after', align: 'right', render: fmtYuan },
+    {
+      title: '明细',
+      key: 'detail',
+      render: (_, e) =>
+        e.kind === 'consume' ? (
+          <Space size={4} wrap>
+            <span>
+              {fmtNum(e.count)}次 × {fmtYuan(e.unit_price)}元
+            </span>
+            <Link to={`/installs/${e.install_id}`}>
+              <IdText id={e.install_id} />
+            </Link>
+            <span>seq {e.seq}</span>
+          </Space>
+        ) : (
+          <span>
+            {e.operator}
+            {e.remark && `：${e.remark}`}
+          </span>
+        ),
+    },
+  ]
+  return (
+    <Drawer open title={`计费流水 ${k.app_key}`} size={900} onClose={onClose} destroyOnHidden>
+      <CursorTable<LedgerEntry>
+        rowKey={(e) => String(e.id)}
+        columns={columns}
+        fetchPage={(cursor) => apiGet<Page<LedgerEntry>>(`/app-keys/${k.id}/ledger`, { cursor })}
+      />
+    </Drawer>
+  )
+}
+
+// AppKeys App Key 管理：生成(或导入已发给客户的)、定价、充值、流水、停用 / 启用。注册、上报只认已启用的 App Key。
 export default function AppKeys() {
   const { message } = App.useApp()
   const { data, loading, error, reload } = useApi(() => apiGet<AppKeyList>('/app-keys'), [])
   const [creating, setCreating] = useState(false)
+  const [pricing, setPricing] = useState<AppKey>()
+  const [recharging, setRecharging] = useState<AppKey>()
+  const [ledgerOf, setLedgerOf] = useState<AppKey>()
   const [saving, setSaving] = useState(false)
-  const [form] = Form.useForm<CreateForm>()
+  const [createForm] = Form.useForm<CreateForm>()
+  const [priceForm] = Form.useForm<PriceForm>()
+  const [rechargeForm] = Form.useForm<RechargeForm>()
 
-  const create = async (v: CreateForm) => {
+  // save 统一处理保存中、成功提示、失败提示和刷新列表
+  const save = async (fn: () => Promise<string>, done: () => void) => {
     setSaving(true)
     try {
-      const k = await apiSend<AppKey>('POST', '/app-keys', { remark: v.remark?.trim() ?? '', app_key: v.app_key?.trim() ?? '' })
-      message.success(`已创建 ${k.app_key}`)
-      setCreating(false)
-      form.resetFields()
+      message.success(await fn())
+      done()
       reload()
     } catch (e) {
       message.error(errorText(e))
@@ -34,15 +148,55 @@ export default function AppKeys() {
     }
   }
 
-  const setStatus = async (k: AppKey, status: AppKey['status']) => {
-    try {
+  const create = (v: CreateForm) =>
+    save(
+      async () => {
+        const k = await apiSend<AppKey>('POST', '/app-keys', {
+          remark: v.remark?.trim() ?? '',
+          app_key: v.app_key?.trim() ?? '',
+          unit_price: yuanToUnits(v.unit_price),
+          initial_balance: yuanToUnits(v.initial_balance),
+          overdraft_limit: yuanToUnits(v.overdraft_limit),
+        })
+        return `已创建 ${k.app_key}`
+      },
+      () => {
+        setCreating(false)
+        createForm.resetFields()
+      },
+    )
+
+  const updatePrice = (v: PriceForm) =>
+    pricing &&
+    save(
+      async () => {
+        await apiSend<AppKey>('PATCH', `/app-keys/${pricing.id}`, {
+          unit_price: yuanToUnits(v.unit_price),
+          overdraft_limit: yuanToUnits(v.overdraft_limit),
+        })
+        return '定价已修改'
+      },
+      () => setPricing(undefined),
+    )
+
+  const recharge = (v: RechargeForm) =>
+    recharging &&
+    save(
+      async () => {
+        const k = await apiSend<AppKey>('POST', `/app-keys/${recharging.id}/recharge`, {
+          amount: yuanToUnits(v.amount),
+          remark: v.remark?.trim() ?? '',
+        })
+        return `已充值，余额 ${fmtYuan(k.balance)} 元`
+      },
+      () => setRecharging(undefined),
+    )
+
+  const setStatus = (k: AppKey, status: AppKey['status']) =>
+    save(async () => {
       await apiSend<AppKey>('PATCH', `/app-keys/${k.id}`, { status })
-      message.success(status === 'enabled' ? '已启用' : '已停用')
-      reload()
-    } catch (e) {
-      message.error(errorText(e))
-    }
-  }
+      return status === 'enabled' ? '已启用' : '已停用'
+    }, () => {})
 
   const columns: TableColumnsType<AppKey> = [
     {
@@ -60,42 +214,95 @@ export default function AppKeys() {
       dataIndex: 'status',
       render: (v: AppKey['status']) => (v === 'enabled' ? <Tag color="green">已启用</Tag> : <Tag>已停用</Tag>),
     },
+    { title: '单价(元/次)', dataIndex: 'unit_price', align: 'right', render: (v: number) => (v ? fmtYuan(v) : '-') },
+    {
+      title: '余额(元)',
+      dataIndex: 'balance',
+      align: 'right',
+      render: (v: number) => <span style={{ color: v < 0 ? '#cf1322' : undefined }}>{fmtYuan(v)}</span>,
+    },
+    { title: '透支额度(元)', dataIndex: 'overdraft_limit', align: 'right', render: fmtYuan },
+    { title: '计费次数', dataIndex: 'used_count', align: 'right', render: fmtNum },
+    {
+      title: '计费',
+      dataIndex: 'billing_state',
+      render: (v: AppKey['billing_state']) => <Tag color={BILLING_TAG[v].color}>{BILLING_TAG[v].text}</Tag>,
+    },
     { title: '创建人', dataIndex: 'created_by' },
     { title: '创建时间', dataIndex: 'created_at', render: fmtTime },
     {
       title: '操作',
       key: 'action',
-      render: (_, k) =>
-        k.status === 'enabled' ? (
-          <Popconfirm
-            title="停用这个 App Key？"
-            description="停用后，带这个 App Key 的注册和上报都会被拒绝(403)。"
-            okText="停用"
-            cancelText="取消"
-            onConfirm={() => setStatus(k, 'disabled')}
+      fixed: 'right',
+      render: (_, k) => (
+        <Space size={0}>
+          <Button
+            type="link"
+            size="small"
+            onClick={() => {
+              rechargeForm.resetFields()
+              setRecharging(k)
+            }}
           >
-            <Button type="link" size="small" danger>
-              停用
-            </Button>
-          </Popconfirm>
-        ) : (
-          <Button type="link" size="small" onClick={() => setStatus(k, 'enabled')}>
-            启用
+            充值
           </Button>
-        ),
+          <Button
+            type="link"
+            size="small"
+            onClick={() => {
+              priceForm.setFieldsValue({
+                unit_price: k.unit_price ? unitsToYuan(k.unit_price) : null,
+                overdraft_limit: unitsToYuan(k.overdraft_limit),
+              })
+              setPricing(k)
+            }}
+          >
+            修改定价
+          </Button>
+          <Button type="link" size="small" onClick={() => setLedgerOf(k)}>
+            流水
+          </Button>
+          {k.status === 'enabled' ? (
+            <Popconfirm
+              title="停用这个 App Key？"
+              description="停用后，带这个 App Key 的注册和上报都会被拒绝(403)。"
+              okText="停用"
+              cancelText="取消"
+              onConfirm={() => setStatus(k, 'disabled')}
+            >
+              <Button type="link" size="small" danger>
+                停用
+              </Button>
+            </Popconfirm>
+          ) : (
+            <Button type="link" size="small" onClick={() => setStatus(k, 'enabled')}>
+              启用
+            </Button>
+          )}
+        </Space>
+      ),
     },
   ]
 
   return (
     <Flex vertical gap={16}>
       <Flex justify="space-between" align="center">
-        <span style={{ color: '#999' }}>注册、上报带的 app_key 必须是这里已启用的 App Key，否则返回 403。</span>
+        <span style={{ color: '#999' }}>
+          注册、上报带的 app_key 必须是这里已启用的 App Key，否则返回 403。按次计费：每次上报按新增测量次数 × 单价从余额扣。
+        </span>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreating(true)}>
           生成 App Key
         </Button>
       </Flex>
       {error && <Alert type="error" title={error} showIcon />}
-      <Table<AppKey> rowKey="id" columns={columns} dataSource={data?.items} loading={loading} pagination={false} />
+      <Table<AppKey>
+        rowKey="id"
+        columns={columns}
+        dataSource={data?.items}
+        loading={loading}
+        pagination={false}
+        scroll={{ x: 'max-content' }}
+      />
 
       <Modal
         title="生成 App Key"
@@ -103,11 +310,11 @@ export default function AppKeys() {
         okText="生成"
         cancelText="取消"
         confirmLoading={saving}
-        onOk={() => form.submit()}
+        onOk={() => createForm.submit()}
         onCancel={() => setCreating(false)}
         destroyOnHidden
       >
-        <Form<CreateForm> form={form} layout="vertical" onFinish={create}>
+        <Form<CreateForm> form={createForm} layout="vertical" onFinish={create}>
           <Form.Item name="remark" label="备注" rules={[{ max: 255, message: '最多255个字' }]}>
             <Input placeholder="例如：阿福正式环境" />
           </Form.Item>
@@ -119,8 +326,62 @@ export default function AppKeys() {
           >
             <Input placeholder="留空自动生成" />
           </Form.Item>
+          <PriceFields />
+          <Form.Item name="initial_balance" label="初始余额" extra="会记一条充值流水；之后用「充值」追加。">
+            <InputNumber {...yuanInput} placeholder="0" />
+          </Form.Item>
         </Form>
       </Modal>
+
+      <Modal
+        title={`修改定价 ${pricing?.app_key ?? ''}`}
+        open={!!pricing}
+        okText="保存"
+        cancelText="取消"
+        confirmLoading={saving}
+        onOk={() => priceForm.submit()}
+        onCancel={() => setPricing(undefined)}
+        destroyOnHidden
+      >
+        <Alert
+          type="info"
+          showIcon
+          style={{ marginBottom: 16 }}
+          title="新单价从下一次上报开始生效；余额只能通过充值和扣费变化。"
+        />
+        <Form<PriceForm> form={priceForm} layout="vertical" onFinish={updatePrice}>
+          <PriceFields />
+        </Form>
+      </Modal>
+
+      <Modal
+        title={`充值 ${recharging?.app_key ?? ''}`}
+        open={!!recharging}
+        okText="充值"
+        cancelText="取消"
+        confirmLoading={saving}
+        onOk={() => rechargeForm.submit()}
+        onCancel={() => setRecharging(undefined)}
+        destroyOnHidden
+      >
+        {recharging && (
+          <Alert type="info" showIcon style={{ marginBottom: 16 }} title={`当前余额 ${fmtYuan(recharging.balance)} 元`} />
+        )}
+        <Form<RechargeForm> form={rechargeForm} layout="vertical" onFinish={recharge}>
+          <Form.Item
+            name="amount"
+            label="充值金额"
+            rules={[{ required: true, type: 'number', min: 0.0001, message: '充值金额必须大于0' }]}
+          >
+            <InputNumber {...yuanInput} placeholder="例如 100" />
+          </Form.Item>
+          <Form.Item name="remark" label="备注" rules={[{ max: 255, message: '最多255个字' }]}>
+            <Input placeholder="例如：10月续费" />
+          </Form.Item>
+        </Form>
+      </Modal>
+
+      {ledgerOf && <LedgerDrawer k={ledgerOf} onClose={() => setLedgerOf(undefined)} />}
     </Flex>
   )
 }

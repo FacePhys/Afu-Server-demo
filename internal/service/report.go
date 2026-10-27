@@ -50,7 +50,7 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 		if err != nil {
 			return err
 		}
-		res.respType, res.installID, res.appKey = protocol.TypeAck, inst.InstallID, inst.AppKey
+		res.respType, res.installID, res.appKey = protocol.TypeAck, inst.InstallID, req.AppKey // 按这次请求带的 App Key 计次
 
 		// 重复上报：不入库、不扣费，按当前状态回ack
 		if req.Seq <= inst.ConfirmedSeq {
@@ -66,7 +66,8 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 		if regressed {
 			s.log.Warn("counters regressed", "install_id", inst.InstallID, "seq", req.Seq)
 		}
-		charge, err := s.billing.Charge(ctx, tx, inst.AppKey, delta) // 留桩
+		charge, err := s.billing.Charge(ctx, tx, billing.ChargeRequest{ // 按新增测量次数扣费、判断额度
+			AppKey: req.AppKey, InstallID: inst.InstallID, Seq: req.Seq, Delta: delta})
 		if err != nil {
 			return err
 		}

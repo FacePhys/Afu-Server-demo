@@ -5,6 +5,7 @@ import { apiGet, type Params } from '../api/client'
 import type { Page, Report, ReportedMeasurement } from '../api/types'
 import { useApi } from '../api/useApi'
 import { fmtDuration, fmtNum } from '../utils/format'
+import { fmtYuan } from '../utils/money'
 import { fmtMs, fmtTime } from '../utils/time'
 import CursorTable from './CursorTable'
 import { DurationText, IdText, JsonView } from './Common'
@@ -57,6 +58,7 @@ export default function UploadsTable({ filters, showInstall = true }: { filters:
     { title: '客户端时间', dataIndex: 'client_ts', render: (v: number) => <ClientTime ms={v} /> },
     { title: '服务端收到时间', dataIndex: 'received_at', render: fmtTime },
     { title: '本次测量', key: 'measurements', render: (_, r) => <ReportedMeasurements items={r.measurements} /> },
+    { title: '本次扣费(元)', dataIndex: 'charge', align: 'right', render: (v: number) => (v ? fmtYuan(v) : '-') },
     { title: '累计测量次数', key: 'sessions', align: 'right', render: (_, r) => fmtNum(r.counters.sessions) },
     { title: '累计有效帧数', key: 'frames_ok', align: 'right', render: (_, r) => fmtNum(r.counters.frames_ok) },
     {

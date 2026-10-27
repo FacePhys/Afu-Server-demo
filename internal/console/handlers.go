@@ -163,6 +163,12 @@ func (s *Server) handleDaily(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
+// reportRow 上传记录列表的查询结果：上报 + 本次扣费。
+type reportRow struct {
+	store.Report
+	Charge int64 `gorm:"column:charge"`
+}
+
 func toInstall(r store.Install) Install {
 	return Install{InstallID: r.InstallID, AppID: r.AppID, Platform: r.Platform, SDK: r.SDK,
 		ResetReason: r.ResetReason, ConfirmedSeq: r.ConfirmedSeq, Counters: r.Counters(),
@@ -267,7 +273,10 @@ func (s *Server) handleReports(c *gin.Context) {
 	defer cancel()
 
 	// 每行是一次上传：返回解析后的counters和measurements，不返回原始明文
-	q := db.Table("reports AS r").Select("r.id, r.install_id, r.seq, r.client_ts, r.payload, r.received_at")
+	// 本次扣费从计费流水取：一份上报最多一条扣费流水(install_id + seq)
+	q := db.Table("reports AS r").
+		Select("r.id, r.install_id, r.seq, r.client_ts, r.payload, r.received_at, COALESCE(-l.amount, 0) AS charge").
+		Joins("LEFT JOIN billing_ledger AS l ON l.install_id = r.install_id AND l.seq = r.seq AND l.kind = ?", store.LedgerConsume)
 	if v := c.Query("install_id"); v != "" {
 		q = q.Where("r.install_id = ?", v)
 	}
@@ -283,13 +292,17 @@ func (s *Server) handleReports(c *gin.Context) {
 	if cursor > 0 {
 		q = q.Where("r.id < ?", cursor)
 	}
-	var rows []store.Report
-	if err := q.Order("r.id DESC").Limit(limit + 1).Find(&rows).Error; err != nil {
+	var rows []reportRow
+	if err := q.Order("r.id DESC").Limit(limit + 1).Scan(&rows).Error; err != nil {
 		s.failErr(c, err)
 		return
 	}
-	page := paginate(rows, limit, func(r store.Report) uint64 { return r.ID })
-	c.JSON(http.StatusOK, mapPage(page, s.toReport))
+	page := paginate(rows, limit, func(r reportRow) uint64 { return r.ID })
+	c.JSON(http.StatusOK, mapPage(page, func(r reportRow) Report {
+		out := s.toReport(r.Report)
+		out.Charge = r.Charge
+		return out
+	}))
 }
 
 func (s *Server) handleReport(c *gin.Context) {
@@ -305,8 +318,15 @@ func (s *Server) handleReport(c *gin.Context) {
 		s.failErr(c, err)
 		return
 	}
+	var charge int64
+	if err := db.Model(&store.LedgerEntry{}).Select("COALESCE(-SUM(amount), 0)").
+		Where("install_id = ? AND seq = ? AND kind = ?", r.InstallID, r.Seq, store.LedgerConsume).Scan(&charge).Error; err != nil {
+		s.failErr(c, err)
+		return
+	}
 	out := s.toReport(r)
 	out.Payload = json.RawMessage(r.Payload)
+	out.Charge = charge
 	c.JSON(http.StatusOK, out)
 }
 

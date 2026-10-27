@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import dayjs from 'dayjs'
 import { fmtDuration, fmtNum } from './format'
+import { fmtYuan, unitsToYuan, yuanToUnits } from './money'
 import { dayRange, fmtMs, fmtTime, presetRange, rangeParams, toParam, TZ } from './time'
 
 describe('format', () => {
@@ -34,5 +35,24 @@ describe('time', () => {
   it('自定义日期区间左闭右开', () => {
     const r = dayRange(dayjs.tz('2026-10-24 15:00:00', TZ), dayjs.tz('2026-10-26 09:00:00', TZ))
     expect(rangeParams(r)).toEqual({ from: '2026-10-24T00:00:00+08:00', to: '2026-10-27T00:00:00+08:00' })
+  })
+})
+
+
+describe('money', () => {
+  it('显示：至少2位、最多4位小数', () => {
+    expect(fmtYuan(5000)).toBe('0.50')
+    expect(fmtYuan(10000)).toBe('1.00')
+    expect(fmtYuan(12345)).toBe('1.2345')
+    expect(fmtYuan(12340)).toBe('1.234')
+    expect(fmtYuan(-15001)).toBe('-1.5001')
+    expect(fmtYuan(0)).toBe('0.00')
+  })
+  it('元和金额单位互转', () => {
+    expect(yuanToUnits(0.5)).toBe(5000)
+    expect(yuanToUnits(0.0001)).toBe(1)
+    expect(yuanToUnits(19.99)).toBe(199900)
+    expect(yuanToUnits(null)).toBe(0)
+    expect(unitsToYuan(5000)).toBe(0.5)
   })
 })

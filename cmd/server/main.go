@@ -61,7 +61,7 @@ func run(cfgPath string) error {
 	}
 	defer sqlDB.Close()
 
-	svc := service.New(db, billing.Noop{}, billing.LogNotifier{Log: log}, cfg.Meter, log)
+	svc := service.New(db, billing.KeyBilling{DB: db}, billing.LogNotifier{Log: log}, cfg.Meter, log)
 
 	if os.Getenv(gin.EnvGinMode) == "" {
 		gin.SetMode(gin.ReleaseMode)

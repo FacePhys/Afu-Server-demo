@@ -79,6 +79,7 @@ export interface Report {
   received_at: string
   counters: Counters // 从明文解析，累计值
   measurements: ReportedMeasurement[] // 本次上报带的测量；空上报为[]
+  charge: number // 本次上报扣的钱，0.0001元；没扣费为0
   payload?: unknown // 原始明文，只有详情接口返回
 }
 
@@ -87,6 +88,12 @@ export interface AppKey {
   app_key: string
   remark: string
   status: 'enabled' | 'disabled'
+  // 金额单位 0.0001 元，见 utils/money.ts
+  unit_price: number // 单价/次，0为不收费
+  balance: number // 余额，透支时为负
+  overdraft_limit: number // 透支额度
+  used_count: number // 累计计费测量次数
+  billing_state: 'free' | 'normal' | 'overdraft' | 'exhausted'
   created_by: string
   created_at: string
   updated_at: string
@@ -94,4 +101,19 @@ export interface AppKey {
 
 export interface AppKeyList {
   items: AppKey[]
+}
+
+/** 计费流水，金额单位 0.0001 元 */
+export interface LedgerEntry {
+  id: number
+  kind: 'consume' | 'recharge'
+  amount: number // 扣费为负、充值为正
+  balance_after: number
+  count: number
+  unit_price: number
+  install_id: string
+  seq: number
+  operator: string
+  remark: string
+  created_at: string
 }

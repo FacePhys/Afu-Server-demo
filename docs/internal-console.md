@@ -1,18 +1,18 @@
 # 内部数据后台设计
 
-> 仅供内部使用，不对客户、阿福公开，不写进 `readme.md`。查看安装、上传记录和用量统计；唯一的写操作是 App Key 管理(生成或导入、停用 / 启用)。后台不按 app_key 区分统计。
+> 仅供内部使用，不对客户、阿福公开，不写进 `readme.md`。查看安装、上传记录和用量统计；写操作只有 App Key 管理(生成或导入、定价、充值、停用 / 启用)。后台不按 app_key 区分统计。
 
 ## 总体方案
 
-| 项目     | 方案                                                                      | 说明                                                                                       |
-| -------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
-| 部署     | 和主服务同一个进程，单独监听一个端口                                      | 公网端口只有 `POST /afu/v1/meter`，内部接口从公网端口根本访问不到                          |
-| 监听地址 | 配置项 `admin.addr`，示例配置里留空(不启动)；本地开发填 `127.0.0.1:18081` | 生产只绑内网地址并配防火墙                                                                 |
-| 接口     | `/afu/internal/api/v1/...`，明文json                                      | 查询都是GET；App Key 管理用 POST / PATCH                                                   |
-| 鉴权     | 固定Token：`Authorization: Bearer <token>`                                | 配置里只存Token的SHA-256，按人分配，审计日志记录是谁                                       |
-| 数据库   | 配置项 `admin.db_dsn`，建议单独账号                                       | 留空时复用 `db.dsn`；单独账号只给三张数据表 SELECT、`app_keys` 表 SELECT / INSERT / UPDATE |
-| 前端     | React 19 + Ant Design 6 + Vite + TypeScript                               | 构建产物用 `go:embed` 打进二进制，由后台端口直接提供                                       |
-| 时区     | 库里存UTC；接口返回RFC3339(UTC)；页面按北京时间显示                       | 按天统计按北京时间(UTC+8)分天                                                              |
+| 项目     | 方案                                                                      | 说明                                                                                                                            |
+| -------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| 部署     | 和主服务同一个进程，单独监听一个端口                                      | 公网端口只有 `POST /afu/v1/meter`，内部接口从公网端口根本访问不到                                                               |
+| 监听地址 | 配置项 `admin.addr`，示例配置里留空(不启动)；本地开发填 `127.0.0.1:18081` | 生产只绑内网地址并配防火墙                                                                                                      |
+| 接口     | `/afu/internal/api/v1/...`，明文json                                      | 查询都是GET；App Key 管理用 POST / PATCH                                                                                        |
+| 鉴权     | 固定Token：`Authorization: Bearer <token>`                                | 配置里只存Token的SHA-256，按人分配，审计日志记录是谁                                                                            |
+| 数据库   | 配置项 `admin.db_dsn`，建议单独账号                                       | 留空时复用 `db.dsn`；单独账号只给三张数据表 SELECT、`app_keys` 表 SELECT / INSERT / UPDATE、`billing_ledger` 表 SELECT / INSERT |
+| 前端     | React 19 + Ant Design 6 + Vite + TypeScript                               | 构建产物用 `go:embed` 打进二进制，由后台端口直接提供                                                                            |
+| 时区     | 库里存UTC；接口返回RFC3339(UTC)；页面按北京时间显示                       | 按天统计按北京时间(UTC+8)分天                                                                                                   |
 
 ## 配置
 
@@ -39,6 +39,7 @@ GRANT SELECT ON afu.installs TO 'afu_console'@'10.%';
 GRANT SELECT ON afu.reports TO 'afu_console'@'10.%';
 GRANT SELECT ON afu.measurements TO 'afu_console'@'10.%';
 GRANT SELECT, INSERT, UPDATE ON afu.app_keys TO 'afu_console'@'10.%';
+GRANT SELECT, INSERT ON afu.billing_ledger TO 'afu_console'@'10.%';
 ```
 
 ## 接口约定
@@ -63,19 +64,21 @@ GRANT SELECT, INSERT, UPDATE ON afu.app_keys TO 'afu_console'@'10.%';
 
 ## 接口列表
 
-| 接口                         | 用途                                                       |
-| ---------------------------- | ---------------------------------------------------------- |
-| `GET /me`                    | 校验Token，返回当前用户名                                  |
-| `GET /meta`                  | 服务配置(单次测量额度、ttl_sec、report_sec、可用kid)和版本 |
-| `GET /overview`              | 概览：时间区间内的关键数字                                 |
-| `GET /stats/daily`           | 按天统计                                                   |
-| `GET /installs`              | 安装记录列表                                               |
-| `GET /installs/{install_id}` | 安装记录详情                                               |
-| `GET /reports`               | 上传记录列表：每行一次上报，带解析后的本次测量和累计计数   |
-| `GET /reports/{id}`          | 单次上传详情，含解密后的原始明文                           |
-| `GET /app-keys`              | App Key 列表(新的在前)                                     |
-| `POST /app-keys`             | 生成 App Key；传 `app_key` 时按原值导入                    |
-| `PATCH /app-keys/{id}`       | 停用 / 启用、改备注                                        |
+| 接口                           | 用途                                                       |
+| ------------------------------ | ---------------------------------------------------------- |
+| `GET /me`                      | 校验Token，返回当前用户名                                  |
+| `GET /meta`                    | 服务配置(单次测量额度、ttl_sec、report_sec、可用kid)和版本 |
+| `GET /overview`                | 概览：时间区间内的关键数字                                 |
+| `GET /stats/daily`             | 按天统计                                                   |
+| `GET /installs`                | 安装记录列表                                               |
+| `GET /installs/{install_id}`   | 安装记录详情                                               |
+| `GET /reports`                 | 上传记录列表：每行一次上报，带解析后的本次测量和累计计数   |
+| `GET /reports/{id}`            | 单次上传详情，含解密后的原始明文                           |
+| `GET /app-keys`                | App Key 列表(新的在前)                                     |
+| `POST /app-keys`               | 生成 App Key；传 `app_key` 时按原值导入                    |
+| `PATCH /app-keys/{id}`         | 停用 / 启用、改备注、改单价和透支额度                      |
+| `POST /app-keys/{id}/recharge` | 充值                                                       |
+| `GET /app-keys/{id}/ledger`    | 计费流水(扣费、充值)，游标分页                             |
 
 ### GET /me
 
@@ -166,7 +169,7 @@ GRANT SELECT, INSERT, UPDATE ON afu.app_keys TO 'afu_console'@'10.%';
 
 ### GET /reports
 
-参数：`install_id`、`from`、`to`(按received_at)、`max_dt_ms`(只看带有时长不超过该值的测量的上报，传5000即含短测量)、`cursor`、`limit`。`max_dt_ms` 按 install_id + seq 关联measurements表。列表直接带上报内容：从明文解析出的 `counters`(累计值)和 `measurements`(本次上报带的测量，空上报为 `[]`)；不带原始明文，原文看详情接口。
+参数：`install_id`、`from`、`to`(按received_at)、`max_dt_ms`(只看带有时长不超过该值的测量的上报，传5000即含短测量)、`cursor`、`limit`。`max_dt_ms` 按 install_id + seq 关联measurements表。列表直接带上报内容：从明文解析出的 `counters`(累计值)和 `measurements`(本次上报带的测量，空上报为 `[]`)，以及从计费流水取的本次扣费 `charge`(0.0001元，没扣费为0)；不带原始明文，原文看详情接口。
 
 ```json
 {
@@ -174,7 +177,8 @@ GRANT SELECT, INSERT, UPDATE ON afu.app_keys TO 'afu_console'@'10.%';
     {"id": 2, "install_id": "2638d8400d60c9fedfb1e8bdf92af87a", "seq": 1, "client_ts": 1792478748241,
      "received_at": "2026-10-26T04:14:52.972Z",
      "counters": {"sessions": 1, "frames_ok": 300, "dt_ms": 9966, "mono_ms": 9968, "run_ok": 10, "gated_frames": 0, "gated_runs": 0},
-     "measurements": [{"no": 1, "start_ts": 1792478738236, "end_ts": 1792478748205, "frames": 300, "dt_ms": 9966}]}
+     "measurements": [{"no": 1, "start_ts": 1792478738236, "end_ts": 1792478748205, "frames": 300, "dt_ms": 9966}],
+     "charge": 5000}
   ],
   "next_cursor": ""
 }
@@ -200,27 +204,54 @@ GRANT SELECT, INSERT, UPDATE ON afu.app_keys TO 'afu_console'@'10.%';
 `POST /app-keys` 请求体：
 
 ```json
-{"remark": "阿福正式环境", "app_key": ""}
+{"remark": "阿福正式环境", "app_key": "", "unit_price": 5000, "initial_balance": 1000000, "overdraft_limit": 100000}
 ```
 
 1. `app_key` 留空：生成 `AK-` 加32位小写hex。
 2. `app_key` 有值：按原值导入，用于已经发给客户的 App Key；只能包含字母、数字、`-`、`_`，最多64个字符；已存在返回409。
-3. 返回201和新记录；`created_by` 记录后台Token的name。
+3. 金额一律用整数，单位 0.0001 元(上例：单价0.50元/次、初始余额100元、透支额度10元)。`unit_price` 0或不传表示不收费；`initial_balance` 大于0时记一条「初始余额」充值流水。
+4. 返回201和新记录；`created_by` 记录后台Token的name。
 
-`PATCH /app-keys/{id}` 请求体，两个字段至少一个：
+`PATCH /app-keys/{id}` 请求体，下面字段至少一个：
 
 ```json
-{"status": "disabled", "remark": "已停用"}
+{"status": "disabled", "remark": "已停用", "unit_price": 6000, "overdraft_limit": 200000}
 ```
 
 1. 不提供删除，停用即可；停用后带这个 App Key 的注册、上报返回403。
-2. 生成、修改都会写一条操作日志(操作人、App Key、状态)，另外照常有审计日志。
+2. 余额不能在这里改，只能通过充值和上报扣费变化，保证和流水对得上；新单价从下一次上报开始生效。
+3. 生成、修改、充值都会写一条操作日志(操作人、App Key、金额)，另外照常有审计日志。
 
 返回结构：
 
 ```json
 {"id": 1, "app_key": "AK-f24277919892cdc6a5670c27d6fe1212", "remark": "阿福正式环境", "status": "enabled",
+ "unit_price": 5000, "balance": 383000, "overdraft_limit": 100000, "used_count": 1234, "billing_state": "normal",
  "created_by": "liujiaxuan", "created_at": "2026-10-26T11:17:17.222Z", "updated_at": "2026-10-26T11:17:17.222Z"}
+```
+
+`billing_state`：`free` 不收费；`normal` 余额不为负；`overdraft` 余额为负但还够付一次；`exhausted` 余额加透支额度不够付下一次，停发额度。
+
+`POST /app-keys/{id}/recharge` 请求体：
+
+```json
+{"amount": 500000, "remark": "10月续费"}
+```
+
+`amount` 必须大于0(上例50元)；锁住这个 App Key 的行加余额，记一条充值流水(操作人为后台Token的name)，返回更新后的 App Key。
+
+`GET /app-keys/{id}/ledger` 返回计费流水，按id倒序，参数同列表的 `cursor`、`limit`：
+
+```json
+{
+  "items": [
+    {"id": 6, "kind": "recharge", "amount": 50000, "balance_after": 40000, "count": 0, "unit_price": 0,
+     "install_id": "", "seq": 0, "operator": "liujiaxuan", "remark": "续费", "created_at": "2026-10-27T11:29:42.000Z"},
+    {"id": 5, "kind": "consume", "amount": -5000, "balance_after": -10000, "count": 1, "unit_price": 5000,
+     "install_id": "d625747c96a74f6c4ba7e2a6b8c3e597", "seq": 4, "operator": "", "remark": "", "created_at": "2026-10-27T11:29:41.000Z"}
+  ],
+  "next_cursor": ""
+}
 ```
 
 ## 索引
@@ -246,7 +277,7 @@ internal/console/
 ├── server.go     # 后台Gin引擎：中间件(审计、recovery、安全响应头)、路由、静态文件
 ├── auth.go       # Token校验
 ├── handlers.go   # 各查询接口
-├── appkeys.go    # App Key 管理(生成或导入、停用 / 启用)
+├── appkeys.go    # App Key 管理(生成或导入、定价、充值、流水、停用 / 启用)
 ├── params.go     # 参数解析(时间区间、游标、limit)
 └── types.go      # 响应结构体
 web/
@@ -310,15 +341,15 @@ web/
 
 ### 页面
 
-| 路由                   | 页面     | 内容                                                                                                                                                  |
-| ---------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/login`               | 登录     | 输入Token，调 `/me` 校验通过后存入sessionStorage(关闭标签页即失效)                                                                                    |
-| `/`                    | 概览     | 时间区间选择；关键数字卡片；按天的测量次数和时长柱状图；平台分布                                                                                      |
-| `/usage`               | 用量统计 | 时间区间选择；按天柱状图；按天表格(新的日期在前)，表尾是区间合计                                                                                      |
-| `/installs`            | 安装     | 筛选(install_id、平台、新安装原因、创建时间) + 表格；每行有「查看上传记录」按钮(点整行也可以)，进入安装详情                                           |
-| `/installs/:installId` | 安装详情 | 左上角「返回」(回到进来前的页面，直接打开链接时回到安装列表)；基本信息、已确认seq和counters；「上传记录」列出该编号全部已入库的上报，内容同上传记录页 |
-| `/uploads`             | 上传记录 | 筛选(install_id、收到时间、只看含5秒及以内测量的) + 表格：每行一次上传，直接显示本次测量和累计计数，空上报单独标出；点「查看明文」在抽屉里看原文      |
-| `/app-keys`            | App Key  | 列表；「生成 App Key」弹窗(备注、可选的导入值)；停用需二次确认，已停用的可重新启用                                                                    |
+| 路由                   | 页面     | 内容                                                                                                                                                                                                   |
+| ---------------------- | -------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `/login`               | 登录     | 输入Token，调 `/me` 校验通过后存入sessionStorage(关闭标签页即失效)                                                                                                                                     |
+| `/`                    | 概览     | 时间区间选择；关键数字卡片；按天的测量次数和时长柱状图；平台分布                                                                                                                                       |
+| `/usage`               | 用量统计 | 时间区间选择；按天柱状图；按天表格(新的日期在前)，表尾是区间合计                                                                                                                                       |
+| `/installs`            | 安装     | 筛选(install_id、平台、新安装原因、创建时间) + 表格；每行有「查看上传记录」按钮(点整行也可以)，进入安装详情                                                                                            |
+| `/installs/:installId` | 安装详情 | 左上角「返回」(回到进来前的页面，直接打开链接时回到安装列表)；基本信息、已确认seq和counters；「上传记录」列出该编号全部已入库的上报，内容同上传记录页                                                  |
+| `/uploads`             | 上传记录 | 筛选(install_id、收到时间、只看含5秒及以内测量的) + 表格：每行一次上传，直接显示本次测量、本次扣费和累计计数，空上报单独标出；点「查看明文」在抽屉里看原文                                             |
+| `/app-keys`            | App Key  | 列表：单价、余额(负数标红)、透支额度、计费次数、计费状态；「生成 App Key」弹窗(备注、可选的导入值、单价、透支额度、初始余额)；「充值」；「修改定价」；「流水」抽屉；停用需二次确认，已停用的可重新启用 |
 
 左侧菜单：概览、用量统计、安装、上传记录、App Key；顶部右侧显示服务版本、当前用户名和「退出」。
 
@@ -381,20 +412,20 @@ web/
 ## 测试
 
 1. 后端单元测试：鉴权(无Token、错误Token、正确Token)、参数解析(时间格式、区间上限、limit上限、游标)。
-2. 后端集成测试(`AFU_TEST_DSN`，和主流程的集成测试共用测试库，`make itest` 用 `-p 1` 串行跑)：造几条安装、上报、测量，校验每个接口的统计数字、过滤条件、翻页不重不漏、按北京时间分天；App Key 的生成、导入、重复导入、停用。
+2. 后端集成测试(`AFU_TEST_DSN`，和主流程的集成测试共用测试库，`make itest` 用 `-p 1` 串行跑)：造几条安装、上报、测量，校验每个接口的统计数字、过滤条件、翻页不重不漏、按北京时间分天；App Key 的生成、导入、重复导入、停用、定价、充值、流水与计费状态；上传记录的本次扣费。
 3. 前端：`tsc --noEmit` 类型检查和构建必须通过；`utils/` 里的时间、时长格式化写单元测试(Vitest)。
 
 ## 开发顺序
 
-| 阶段 | 内容                                      | 验收                                                         |
-| ---- | ----------------------------------------- | ------------------------------------------------------------ |
-| 1    | 配置、Token鉴权、审计日志、后台监听、索引 | 无Token返回401，正确Token访问 `/me` 返回用户名               |
-| 2    | 查询接口：installs、reports、measurements | 集成测试覆盖过滤和翻页                                       |
-| 3    | 统计接口：overview、stats/daily           | 集成测试校验统计数字和分天                                   |
-| 4    | 前端：登录、布局、安装 / 上传记录页面     | 本地 `make web-dev` 能查到fakeclient造的数据                 |
-| 5    | 前端：概览、用量统计图表                  | 同上                                                         |
-| 6    | 前端打进二进制，`make build` 一个产物     | 只启动server就能打开后台                                     |
-| 7    | App Key 管理：接口 + 页面                 | 集成测试覆盖生成、导入、重复导入409、停用；停用后注册返回403 |
+| 阶段 | 内容                                      | 验收                                                                           |
+| ---- | ----------------------------------------- | ------------------------------------------------------------------------------ |
+| 1    | 配置、Token鉴权、审计日志、后台监听、索引 | 无Token返回401，正确Token访问 `/me` 返回用户名                                 |
+| 2    | 查询接口：installs、reports、measurements | 集成测试覆盖过滤和翻页                                                         |
+| 3    | 统计接口：overview、stats/daily           | 集成测试校验统计数字和分天                                                     |
+| 4    | 前端：登录、布局、安装 / 上传记录页面     | 本地 `make web-dev` 能查到fakeclient造的数据                                   |
+| 5    | 前端：概览、用量统计图表                  | 同上                                                                           |
+| 6    | 前端打进二进制，`make build` 一个产物     | 只启动server就能打开后台                                                       |
+| 7    | App Key 管理：接口 + 页面                 | 集成测试覆盖生成、导入、重复导入409、停用、定价、充值、流水；停用后注册返回403 |
 
 ## 后续(本期不做)
 

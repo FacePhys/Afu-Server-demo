@@ -102,15 +102,73 @@ const (
 	AppKeyDisabled = "disabled"
 )
 
+// 金额一律用整数，单位 0.0001 元。
+const MoneyUnitsPerYuan = 10000
+
 // AppKey 由内部后台生成或导入，注册、上报带的 app_key 必须存在且已启用。
+// 按次计费：每次上报按「新增测量次数 × 单价」从余额扣，余额加透支额度不够付下一次时停发额度。
 type AppKey struct {
-	ID        uint64    `gorm:"column:id;primaryKey"`
-	AppKey    string    `gorm:"column:app_key"`
-	Remark    string    `gorm:"column:remark"`
-	Status    string    `gorm:"column:status"`
-	CreatedBy string    `gorm:"column:created_by"`
-	CreatedAt time.Time `gorm:"column:created_at"`
-	UpdatedAt time.Time `gorm:"column:updated_at"`
+	ID             uint64    `gorm:"column:id;primaryKey"`
+	AppKey         string    `gorm:"column:app_key"`
+	Remark         string    `gorm:"column:remark"`
+	Status         string    `gorm:"column:status"`
+	UnitPrice      uint64    `gorm:"column:unit_price"`      // 单价，0.0001元/次；0为不收费
+	Balance        int64     `gorm:"column:balance"`         // 余额，0.0001元；透支时为负
+	OverdraftLimit uint64    `gorm:"column:overdraft_limit"` // 透支额度，0.0001元
+	UsedCount      uint64    `gorm:"column:used_count"`      // 累计计费测量次数
+	CreatedBy      string    `gorm:"column:created_by"`
+	CreatedAt      time.Time `gorm:"column:created_at"`
+	UpdatedAt      time.Time `gorm:"column:updated_at"`
 }
 
 func (AppKey) TableName() string { return "app_keys" }
+
+// 计费状态
+const (
+	BillingFree      = "free"      // 单价为0，不收费
+	BillingNormal    = "normal"    // 余额不为负，还能付下一次
+	BillingOverdraft = "overdraft" // 余额为负，靠透支额度还能付下一次
+	BillingExhausted = "exhausted" // 余额加透支额度不够付下一次，停发额度
+)
+
+// HasQuota 余额加透支额度够不够付下一次测量。
+func (k AppKey) HasQuota() bool {
+	return k.UnitPrice == 0 || k.Balance+int64(k.OverdraftLimit) >= int64(k.UnitPrice)
+}
+
+// BillingState 计费状态，后台展示和预警用。
+func (k AppKey) BillingState() string {
+	switch {
+	case k.UnitPrice == 0:
+		return BillingFree
+	case !k.HasQuota():
+		return BillingExhausted
+	case k.Balance < 0:
+		return BillingOverdraft
+	default:
+		return BillingNormal
+	}
+}
+
+const (
+	LedgerConsume  = "consume"
+	LedgerRecharge = "recharge"
+)
+
+// LedgerEntry 计费流水：每笔扣费、充值一条。
+type LedgerEntry struct {
+	ID           uint64    `gorm:"column:id;primaryKey"`
+	AppKey       string    `gorm:"column:app_key"`
+	Kind         string    `gorm:"column:kind"`
+	Amount       int64     `gorm:"column:amount"`        // 扣费为负、充值为正
+	BalanceAfter int64     `gorm:"column:balance_after"` // 变动后的余额
+	Count        uint64    `gorm:"column:count"`         // 扣费：本次计费的测量次数
+	UnitPrice    uint64    `gorm:"column:unit_price"`    // 扣费：当时的单价
+	InstallID    string    `gorm:"column:install_id"`    // 扣费：哪台设备
+	Seq          uint64    `gorm:"column:seq"`           // 扣费：哪份上报
+	Operator     string    `gorm:"column:operator"`      // 充值：后台操作人
+	Remark       string    `gorm:"column:remark"`
+	CreatedAt    time.Time `gorm:"column:created_at"`
+}
+
+func (LedgerEntry) TableName() string { return "billing_ledger" }

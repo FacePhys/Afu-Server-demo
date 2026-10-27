@@ -51,7 +51,7 @@ func setupDB(t *testing.T) *gorm.DB {
 	if err := store.ApplyMigrations(db, "../../migrations"); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"installs", "reports", "measurements", "app_keys"} {
+	for _, table := range []string{"installs", "reports", "measurements", "app_keys", "billing_ledger"} {
 		if err := db.Exec("TRUNCATE TABLE " + table).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -301,5 +301,62 @@ func TestIntegrationAppKeys(t *testing.T) {
 	}
 	if w = send(t, h, http.MethodPatch, base+"/999999", `{"status":"enabled"}`); w.Code != http.StatusNotFound {
 		t.Fatalf("不存在: %d", w.Code)
+	}
+
+	// 定价：创建时设单价、初始余额、透支额度；初始余额记一条充值流水
+	w = send(t, h, http.MethodPost, base, `{"remark":"计费","unit_price":5000,"initial_balance":10000,"overdraft_limit":20000}`)
+	var priced AppKey
+	json.Unmarshal(w.Body.Bytes(), &priced)
+	if w.Code != http.StatusCreated || priced.UnitPrice != 5000 || priced.Balance != 10000 || priced.OverdraftLimit != 20000 ||
+		priced.BillingState != "normal" {
+		t.Fatalf("创建: %d %s", w.Code, w.Body)
+	}
+	if gen.BillingState != "free" {
+		t.Fatalf("默认不收费: %+v", gen)
+	}
+
+	// 余额为负但加上透支额度还够付一次：透支中；不够付一次：已停发；充值后恢复
+	db.Model(&store.AppKey{}).Where("id = ?", priced.ID).Update("balance", -1000)
+	if k := getJSON[AppKeyList](t, h, base).Items[0]; k.BillingState != "overdraft" {
+		t.Fatalf("透支中: %+v", k)
+	}
+	db.Model(&store.AppKey{}).Where("id = ?", priced.ID).Update("balance", -15001)
+	if k := getJSON[AppKeyList](t, h, base).Items[0]; k.BillingState != "exhausted" {
+		t.Fatalf("已停发: %+v", k)
+	}
+	w = send(t, h, http.MethodPost, base+"/"+itoa(priced.ID)+"/recharge", `{"amount":20000,"remark":"续费"}`)
+	var recharged AppKey
+	json.Unmarshal(w.Body.Bytes(), &recharged)
+	if w.Code != http.StatusOK || recharged.Balance != 20000-15001 || recharged.BillingState != "normal" {
+		t.Fatalf("充值: %d %s", w.Code, w.Body)
+	}
+
+	// 改单价、透支额度；余额不能直接改
+	w = send(t, h, http.MethodPatch, base+"/"+itoa(priced.ID), `{"unit_price":0,"overdraft_limit":0,"balance":999}`)
+	json.Unmarshal(w.Body.Bytes(), &upd)
+	if w.Code != http.StatusOK || upd.UnitPrice != 0 || upd.BillingState != "free" || upd.Balance != 20000-15001 {
+		t.Fatalf("改单价: %d %s", w.Code, w.Body)
+	}
+
+	// 流水：初始余额 + 续费，新的在前，操作人是后台用户
+	ledger := getJSON[Page[LedgerEntry]](t, h, base+"/"+itoa(priced.ID)+"/ledger")
+	if len(ledger.Items) != 2 || ledger.Items[0].Remark != "续费" || ledger.Items[0].Amount != 20000 ||
+		ledger.Items[0].Operator != "alice" || ledger.Items[1].Remark != "初始余额" || ledger.Items[1].BalanceAfter != 10000 {
+		t.Fatalf("流水 = %+v", ledger.Items)
+	}
+}
+
+func TestIntegrationReportCharge(t *testing.T) {
+	h, db := setupServer(t)
+	// A 的 seq=1 扣了0.50元
+	db.Create(&store.LedgerEntry{AppKey: "AK1", Kind: store.LedgerConsume, Amount: -5000, BalanceAfter: 0, Count: 1,
+		UnitPrice: 5000, InstallID: idA, Seq: 1})
+	p := getJSON[Page[Report]](t, h, api+"/reports?install_id="+idA)
+	if len(p.Items) != 2 || p.Items[0].Charge != 0 || p.Items[1].Charge != 5000 {
+		t.Fatalf("列表扣费 = %+v", p.Items)
+	}
+	r := getJSON[Report](t, h, api+"/reports/"+itoa(p.Items[1].ID))
+	if r.Charge != 5000 {
+		t.Fatalf("详情扣费 = %d", r.Charge)
 	}
 }

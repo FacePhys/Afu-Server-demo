@@ -85,5 +85,6 @@ type Report struct {
 	ReceivedAt   time.Time              `json:"received_at"`
 	Counters     protocol.Counters      `json:"counters"`          // 从明文解析，累计值
 	Measurements []protocol.Measurement `json:"measurements"`      // 从明文解析，本次上报带的测量；空上报为[]
+	Charge       int64                  `json:"charge"`            // 本次上报扣的钱，0.0001元；没扣费为0
 	Payload      json.RawMessage        `json:"payload,omitempty"` // 原始明文，只有详情接口返回
 }

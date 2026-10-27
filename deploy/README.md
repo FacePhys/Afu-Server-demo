@@ -83,6 +83,8 @@
    ```
 
 8. App Key：在后台「App Key」页点「生成 App Key」，把生成的值发给客户。已经发给客户的 App Key 填在「导入已有的 App Key」里。没有已启用的 App Key 时，所有注册、上报都返回403。
+
+   生成时设置单价(元/次)、初始余额、透支额度：每次上报按「新增测量次数 × 单价」从余额扣，余额可以透支到负的透支额度；余额加透支额度不够付下一次时停发额度，客户端不能再开始新测量。之后用「充值」追加余额、用「修改定价」调整单价和透支额度，每笔扣费、充值都在「流水」里。单价为0表示不收费。
 9. 冒烟测试(会在库里留下几条测试数据，计入统计)：
 
    ```bash
@@ -99,10 +101,13 @@
 1. 新安装包解压到临时目录，`docker load` 加载新镜像。
 2. 新包里的 `docker-compose.yml`、`migrations/` 有变化时，复制到 `/opt/afu` 覆盖；`.env`、`config.yaml`、`keys/` 不要覆盖。
 3. 改 `/opt/afu/.env` 里的 `AFU_VERSION` 为新版本。
-4. 有新的迁移文件时，先在数据库里执行(已有数据的库不会自动执行)：
+4. 有新的迁移文件时，先在数据库里按文件名顺序执行新增的文件(已有数据的库不会自动执行；每个文件只执行一次)：
 
    ```bash
-   sudo docker compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" afu' < migrations/002_app_keys.sql
+   # 例：从 794de2f 升级需要执行 002、003；从 4decc97 升级只需要 003
+   for f in migrations/002_app_keys.sql migrations/003_billing.sql; do
+     sudo docker compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" afu' < "$f"
+   done
    ```
 
    从「app_key 写在配置里」的版本升级时：先执行 `002_app_keys.sql`，升级后马上在后台把原来配置里的 app_key 导入，否则客户端请求会返回403。
@@ -131,13 +136,14 @@
 
 ## 日常运维
 
-| 操作         | 命令                                                                            |
-| ------------ | ------------------------------------------------------------------------------- |
-| 看日志       | `sudo docker compose logs -f --tail 200 afu`                                    |
-| 重启服务     | `sudo docker compose restart afu`                                               |
-| 停止全部     | `sudo docker compose down`(数据在卷里，不会丢；不要加 `-v`)                     |
-| 备份数据库   | 见下方命令                                                                      |
-| 新增后台用户 | `./gen-admin-token.sh`，填进 `config.yaml` 后 `sudo docker compose restart afu` |
+| 操作           | 命令                                                                                    |
+| -------------- | --------------------------------------------------------------------------------------- |
+| 看日志         | `sudo docker compose logs -f --tail 200 afu`                                            |
+| 重启服务       | `sudo docker compose restart afu`                                                       |
+| 停止全部       | `sudo docker compose down`(数据在卷里，不会丢；不要加 `-v`)                             |
+| 备份数据库     | 见下方命令                                                                              |
+| 新增后台用户   | `./gen-admin-token.sh`，填进 `config.yaml` 后 `sudo docker compose restart afu`         |
+| 充值、调整定价 | 后台「App Key」页「充值」「修改定价」；停发后充值即可恢复；每笔扣费、充值在「流水」里查 |
 
 备份数据库：
 

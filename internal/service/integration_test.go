@@ -3,11 +3,14 @@ package service
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"sync"
 	"testing"
+	"time"
 
 	"gorm.io/gorm"
 
@@ -30,10 +33,10 @@ type countingBilling struct {
 
 func (b *countingBilling) HasQuota(context.Context, string) (bool, error) { return !b.noQuota, nil }
 
-func (b *countingBilling) Charge(_ context.Context, _ *gorm.DB, _ string, d protocol.Counters) (billing.ChargeResult, error) {
+func (b *countingBilling) Charge(_ context.Context, _ *gorm.DB, req billing.ChargeRequest) (billing.ChargeResult, error) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.charges = append(b.charges, d)
+	b.charges = append(b.charges, req.Delta)
 	return billing.ChargeResult{HasQuota: !b.noQuota}, nil
 }
 
@@ -57,7 +60,7 @@ func setup(t *testing.T) (*Service, *countingBilling, *gorm.DB) {
 	if err := store.ApplyMigrations(db, "../../migrations"); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"installs", "reports", "measurements", "app_keys"} {
+	for _, table := range []string{"installs", "reports", "measurements", "app_keys", "billing_ledger"} {
 		if err := db.Exec("TRUNCATE TABLE " + table).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -299,5 +302,156 @@ func TestIntegrationInvalidAppKey(t *testing.T) {
 	reg.AppKey = "ak-demo"
 	if _, _, err := s.Register(ctx, reg); err != protocol.ErrInvalidAppKey {
 		t.Fatalf("大小写不同: %v", err)
+	}
+}
+
+// countingNotifier 记录预警次数(QuotaWarning 在 goroutine 里调用)。
+type countingNotifier struct {
+	mu  sync.Mutex
+	got []string
+}
+
+func (n *countingNotifier) QuotaWarning(_ context.Context, appKey string) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.got = append(n.got, appKey)
+}
+
+func (n *countingNotifier) count() int {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return len(n.got)
+}
+
+// yuan 把元换成金额单位(0.0001元)。
+func yuan(v float64) int64 { return int64(math.Round(v * store.MoneyUnitsPerYuan)) }
+
+func TestIntegrationKeyBilling(t *testing.T) {
+	_, _, db := setup(t)
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	notifier := &countingNotifier{}
+	s := New(db, billing.KeyBilling{DB: db}, notifier, meterCfg, log)
+
+	// 单价0.50元，余额1.00元，透支额度1.00元
+	key := store.AppKey{AppKey: "AK-bill", Status: store.AppKeyEnabled, UnitPrice: uint64(yuan(0.5)),
+		Balance: yuan(1), OverdraftLimit: uint64(yuan(1))}
+	if err := db.Create(&key).Error; err != nil {
+		t.Fatal(err)
+	}
+	reg := registerReq(testInstallID)
+	reg.AppKey = "AK-bill"
+	if _, resp, err := s.Register(ctx, reg); err != nil || resp.(protocol.Ack).CapFrames != 300 {
+		t.Fatalf("注册: %+v %v", resp, err)
+	}
+
+	report := func(seq, sessions uint64, withMeasurement bool) protocol.Ack {
+		t.Helper()
+		r := reportReq(testInstallID, seq, 300*sessions, 10*sessions)
+		r.AppKey, r.Counters.Sessions = "AK-bill", sessions
+		if !withMeasurement {
+			r.Measurements = nil
+		}
+		_, resp, err := s.Report(ctx, r, raw(t, r))
+		if err != nil {
+			t.Fatal(err)
+		}
+		return resp.(protocol.Ack)
+	}
+	balance := func() store.AppKey {
+		var k store.AppKey
+		db.Where("app_key = ?", "AK-bill").Take(&k)
+		return k
+	}
+	steps := []struct {
+		seq, sessions uint64
+		measurement   bool
+		capFrames     uint64
+		balance       int64
+		state         string
+		name          string
+	}{
+		{1, 1, true, 600, yuan(0.5), store.BillingNormal, "扣0.50"},
+		{2, 2, true, 900, 0, store.BillingNormal, "余额扣到0"},
+		{3, 3, true, 1200, yuan(-0.5), store.BillingOverdraft, "进入透支，还够付下一次"},
+		{4, 4, true, 1200, yuan(-1), store.BillingExhausted, "透支用完，停发"},
+		{4, 4, true, 1200, yuan(-1), store.BillingExhausted, "重复上报不扣费"},
+		{5, 4, false, 1200, yuan(-1), store.BillingExhausted, "空上报不扣费"},
+	}
+	for _, st := range steps {
+		a := report(st.seq, st.sessions, st.measurement)
+		k := balance()
+		if a.CapFrames != st.capFrames || k.Balance != st.balance || k.BillingState() != st.state {
+			t.Fatalf("%s: cap_frames=%d balance=%d state=%s", st.name, a.CapFrames, k.Balance, k.BillingState())
+		}
+	}
+	if k := balance(); k.UsedCount != 4 {
+		t.Fatalf("累计计费次数 = %d", k.UsedCount)
+	}
+
+	// 每次扣费一条流水，金额、余额、单价、来源都对
+	var ledger []store.LedgerEntry
+	db.Where("app_key = ?", "AK-bill").Order("id").Find(&ledger)
+	if len(ledger) != 4 {
+		t.Fatalf("流水条数 = %d", len(ledger))
+	}
+	for i, e := range ledger {
+		if e.Kind != store.LedgerConsume || e.Amount != -yuan(0.5) || e.Count != 1 || e.UnitPrice != uint64(yuan(0.5)) ||
+			e.InstallID != testInstallID || e.Seq != uint64(i+1) || e.BalanceAfter != yuan(0.5)-int64(i)*yuan(0.5) {
+			t.Fatalf("第%d条流水 = %+v", i+1, e)
+		}
+	}
+
+	// 停发后新设备注册拿不到额度
+	reg2 := registerReq("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	reg2.AppKey = "AK-bill"
+	if _, resp, _ := s.Register(ctx, reg2); resp.(protocol.Ack).CapFrames != 0 {
+		t.Fatalf("停发后注册的 cap = %+v", resp)
+	}
+
+	// 预警：进入透支、停发各一次
+	for i := 0; i < 50 && notifier.count() < 2; i++ {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if notifier.count() != 2 {
+		t.Fatalf("预警次数 = %d", notifier.count())
+	}
+}
+
+func TestIntegrationKeyBillingFreeAndConcurrent(t *testing.T) {
+	_, _, db := setup(t)
+	ctx := context.Background()
+	log := slog.New(slog.NewTextHandler(io.Discard, nil))
+	s := New(db, billing.KeyBilling{DB: db}, billing.LogNotifier{Log: log}, meterCfg, log)
+
+	// AK-demo 单价0：不扣钱，照常计次、记流水；改成0.01元后，20台设备同时上报，余额一分不差
+	db.Model(&store.AppKey{}).Where("app_key = ?", "AK-demo").Updates(map[string]any{"unit_price": yuan(0.01), "balance": yuan(1)})
+	var wg sync.WaitGroup
+	errs := make(chan error, 20)
+	for i := range 20 {
+		id := fmt.Sprintf("%032x", i+1)
+		if _, _, err := s.Register(ctx, registerReq(id)); err != nil {
+			t.Fatal(err)
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := reportReq(id, 1, 300, 10)
+			if _, _, err := s.Report(ctx, r, raw(t, r)); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	var k store.AppKey
+	db.Where("app_key = ?", "AK-demo").Take(&k)
+	var sum int64
+	db.Model(&store.LedgerEntry{}).Where("app_key = ?", "AK-demo").Select("COALESCE(SUM(amount), 0)").Scan(&sum)
+	if k.Balance != yuan(0.8) || k.UsedCount != 20 || sum != -yuan(0.2) {
+		t.Fatalf("余额=%d 次数=%d 流水合计=%d", k.Balance, k.UsedCount, sum)
 	}
 }

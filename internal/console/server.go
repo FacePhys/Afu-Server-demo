@@ -63,6 +63,8 @@ func (s *Server) Router() *gin.Engine {
 	api.GET("/app-keys", s.handleAppKeys)
 	api.POST("/app-keys", s.handleCreateAppKey)
 	api.PATCH("/app-keys/:id", s.handleUpdateAppKey)
+	api.POST("/app-keys/:id/recharge", s.handleRechargeAppKey)
+	api.GET("/app-keys/:id/ledger", s.handleAppKeyLedger)
 
 	r.NoRoute(s.serveStatic)
 	return r

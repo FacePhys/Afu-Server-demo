@@ -198,6 +198,13 @@ func TestAppKeyValidation(t *testing.T) {
 		{http.MethodPatch, base + "/abc", `{"status":"disabled"}`, 404},
 		{http.MethodPatch, base + "/1", `{"status":"deleted"}`, 400},
 		{http.MethodPatch, base + "/1", `{}`, 400},
+		{http.MethodPost, base, `{"unit_price":-1}`, 400},
+		{http.MethodPost, base, `{"unit_price":1000000001}`, 400}, // 超过10万元/次
+		{http.MethodPatch, base + "/1", `{"overdraft_limit":-5}`, 400},
+		{http.MethodPost, base + "/1/recharge", `{"amount":0}`, 400},
+		{http.MethodPost, base + "/1/recharge", `{"amount":-100}`, 400},
+		{http.MethodPost, base + "/abc/recharge", `{"amount":100}`, 404},
+		{http.MethodGet, base + "/abc/ledger", ``, 404},
 	}
 	for _, c := range cases {
 		if w := send(t, r, c.method, c.path, c.body); w.Code != c.status {
