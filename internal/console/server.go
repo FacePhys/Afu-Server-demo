@@ -56,11 +56,13 @@ func (s *Server) Router() *gin.Engine {
 	api.GET("/meta", s.handleMeta)
 	api.GET("/overview", s.handleOverview)
 	api.GET("/stats/daily", s.handleDaily)
-	api.GET("/stats/app-keys", s.handleAppKeys)
 	api.GET("/installs", s.handleInstalls)
 	api.GET("/installs/:install_id", s.handleInstall)
 	api.GET("/reports", s.handleReports)
 	api.GET("/reports/:id", s.handleReport)
+	api.GET("/app-keys", s.handleAppKeys)
+	api.POST("/app-keys", s.handleCreateAppKey)
+	api.PATCH("/app-keys/:id", s.handleUpdateAppKey)
 
 	r.NoRoute(s.serveStatic)
 	return r
@@ -164,8 +166,15 @@ func (s *Server) serveStatic(c *gin.Context) {
 	http.ServeFileFS(c.Writer, c.Request, s.static, name)
 }
 
-// buildVersion 取构建信息里的git提交号。
+// buildRevision 由构建时注入：-ldflags "-X github.com/FacePhys/Afu-Server-demo/internal/console.buildRevision=<版本>"。
+// Docker构建时没有.git，读不到构建信息里的提交号，靠它显示版本。
+var buildRevision string
+
+// buildVersion 优先用注入的版本，否则取构建信息里的git提交号。
 func buildVersion() string {
+	if buildRevision != "" {
+		return buildRevision
+	}
 	info, ok := debug.ReadBuildInfo()
 	if !ok {
 		return "dev"

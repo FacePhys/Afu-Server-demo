@@ -8,7 +8,6 @@ import { rangeParams } from '../utils/time'
 
 interface FilterForm {
   install_id?: string
-  app_key?: string
   range?: [Dayjs, Dayjs]
   short_only?: boolean
 }
@@ -17,10 +16,9 @@ interface FilterForm {
 export default function Uploads() {
   const [filters, setFilters] = useState<Params>({})
 
-  const onFinish = ({ range, install_id, app_key, short_only }: FilterForm) =>
+  const onFinish = ({ range, install_id, short_only }: FilterForm) =>
     setFilters({
       install_id: install_id?.trim(),
-      app_key: app_key?.trim(),
       max_dt_ms: short_only ? SHORT_DT_MS : undefined,
       ...rangeParams(range),
     })
@@ -30,9 +28,6 @@ export default function Uploads() {
       <Form<FilterForm> layout="inline" onFinish={onFinish} style={{ rowGap: 12 }}>
         <Form.Item name="install_id">
           <Input placeholder="install_id" allowClear style={{ width: 300 }} />
-        </Form.Item>
-        <Form.Item name="app_key">
-          <Input placeholder="app_key" allowClear />
         </Form.Item>
         <Form.Item name="range">
           <DatePicker.RangePicker showTime placeholder={['收到时间起', '收到时间止']} />

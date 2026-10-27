@@ -3,6 +3,7 @@
 package service
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
@@ -31,6 +32,17 @@ type Service struct {
 
 func New(db *gorm.DB, b billing.Billing, n billing.Notifier, cfg config.MeterConfig, log *slog.Logger) *Service {
 	return &Service{db: db, billing: b, notifier: n, cfg: cfg, log: log, newID: newInstallID}
+}
+
+// checkAppKey 客户端传来的 app_key 必须在 app_keys 表里且已启用，否则返回 403 invalid_app_key，不入库。
+func (s *Service) checkAppKey(ctx context.Context, installID, appKey string) error {
+	var k store.AppKey
+	err := s.db.WithContext(ctx).Select("status").Where("app_key = ?", appKey).Take(&k).Error
+	if errors.Is(err, gorm.ErrRecordNotFound) || (err == nil && k.Status != store.AppKeyEnabled) {
+		s.log.Warn("invalid app_key", "install_id", installID, "app_key", appKey, "status", k.Status)
+		return protocol.ErrInvalidAppKey
+	}
+	return err
 }
 
 // newInstallID 生成32位小写hex，和客户端生成的格式一致。

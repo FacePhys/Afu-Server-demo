@@ -40,20 +40,6 @@ export interface DailyStats {
   days: DayStat[]
 }
 
-export interface AppKeyStat {
-  app_key: string
-  installs: number
-  active_installs: number
-  measurements: number
-  frames: number
-  dt_ms: number
-  last_report_at: string | null
-}
-
-export interface AppKeyStats {
-  items: AppKeyStat[]
-}
-
 export interface Counters {
   sessions: number
   frames_ok: number
@@ -66,7 +52,6 @@ export interface Counters {
 
 export interface Install {
   install_id: string
-  app_key: string
   app_id: string
   platform: string
   sdk: string
@@ -95,4 +80,18 @@ export interface Report {
   counters: Counters // 从明文解析，累计值
   measurements: ReportedMeasurement[] // 本次上报带的测量；空上报为[]
   payload?: unknown // 原始明文，只有详情接口返回
+}
+
+export interface AppKey {
+  id: number
+  app_key: string
+  remark: string
+  status: 'enabled' | 'disabled'
+  created_by: string
+  created_at: string
+  updated_at: string
+}
+
+export interface AppKeyList {
+  items: AppKey[]
 }

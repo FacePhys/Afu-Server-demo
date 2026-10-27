@@ -9,3 +9,6 @@ bin/
 web/node_modules/
 web/dist/*
 !web/dist/.keep
+
+# 部署包
+release/

@@ -1,11 +1,9 @@
 package console
 
 import (
-	"cmp"
 	"context"
 	"encoding/json"
 	"net/http"
-	"slices"
 	"strconv"
 	"time"
 
@@ -110,7 +108,6 @@ func (s *Server) handleDaily(c *gin.Context) {
 		s.failErr(c, err)
 		return
 	}
-	appKey := c.Query("app_key")
 	db, cancel := s.query(c)
 	defer cancel()
 
@@ -129,11 +126,6 @@ func (s *Server) handleDaily(c *gin.Context) {
 	qm := db.Table("measurements AS m").
 		Select(dayExpr("m.created_at")+" AS d, COUNT(*) AS n, COALESCE(SUM(m.frames), 0) AS frames, COALESCE(SUM(m.dt_ms), 0) AS dt_ms").
 		Where("m.created_at >= ? AND m.created_at < ?", from, to)
-	if appKey != "" {
-		qi = qi.Where("app_key = ?", appKey)
-		qr = qr.Joins("JOIN installs AS i ON i.install_id = r.install_id").Where("i.app_key = ?", appKey)
-		qm = qm.Joins("JOIN installs AS i ON i.install_id = m.install_id").Where("i.app_key = ?", appKey)
-	}
 	err = firstErr(
 		qi.Group("d").Scan(&installs).Error,
 		qr.Group("d").Scan(&reports).Error,
@@ -171,81 +163,8 @@ func (s *Server) handleDaily(c *gin.Context) {
 	c.JSON(http.StatusOK, out)
 }
 
-func (s *Server) handleAppKeys(c *gin.Context) {
-	from, to, err := parseStatsRange(c, s.now(), 30)
-	if err != nil {
-		s.failErr(c, err)
-		return
-	}
-	db, cancel := s.query(c)
-	defer cancel()
-
-	type akRow struct {
-		AppKey string     `gorm:"column:app_key"`
-		N      int64      `gorm:"column:n"`
-		Frames uint64     `gorm:"column:frames"`
-		DtMs   uint64     `gorm:"column:dt_ms"`
-		Last   *time.Time `gorm:"column:last"`
-	}
-	var installs, active, measurements, last []akRow
-	err = firstErr(
-		db.Model(&store.Install{}).Select("app_key, COUNT(*) AS n").Group("app_key").Scan(&installs).Error,
-		db.Table("reports AS r").Select("i.app_key, COUNT(DISTINCT r.install_id) AS n").
-			Joins("JOIN installs AS i ON i.install_id = r.install_id").
-			Where("r.received_at >= ? AND r.received_at < ?", from, to).Group("i.app_key").Scan(&active).Error,
-		db.Table("measurements AS m").
-			Select("i.app_key, COUNT(*) AS n, COALESCE(SUM(m.frames), 0) AS frames, COALESCE(SUM(m.dt_ms), 0) AS dt_ms").
-			Joins("JOIN installs AS i ON i.install_id = m.install_id").
-			Where("m.created_at >= ? AND m.created_at < ?", from, to).Group("i.app_key").Scan(&measurements).Error,
-		db.Table("reports AS r").Select("i.app_key, MAX(r.received_at) AS last").
-			Joins("JOIN installs AS i ON i.install_id = r.install_id").Group("i.app_key").Scan(&last).Error,
-	)
-	if err != nil {
-		s.failErr(c, err)
-		return
-	}
-
-	byKey := map[string]*AppKeyStat{}
-	get := func(k string) *AppKeyStat {
-		if st, ok := byKey[k]; ok {
-			return st
-		}
-		st := &AppKeyStat{AppKey: k}
-		byKey[k] = st
-		return st
-	}
-	for _, r := range installs {
-		get(r.AppKey).Installs = r.N
-	}
-	for _, r := range active {
-		get(r.AppKey).ActiveInstalls = r.N
-	}
-	for _, r := range measurements {
-		st := get(r.AppKey)
-		st.Measurements, st.Frames, st.DtMs = r.N, r.Frames, r.DtMs
-	}
-	for _, r := range last {
-		if r.Last != nil {
-			t := r.Last.UTC()
-			get(r.AppKey).LastReportAt = &t
-		}
-	}
-
-	out := AppKeyStats{Items: make([]AppKeyStat, 0, len(byKey))}
-	for _, st := range byKey {
-		out.Items = append(out.Items, *st)
-	}
-	slices.SortFunc(out.Items, func(a, b AppKeyStat) int { // 测量多的在前，相同时按app_key
-		if n := cmp.Compare(b.Measurements, a.Measurements); n != 0 {
-			return n
-		}
-		return cmp.Compare(a.AppKey, b.AppKey)
-	})
-	c.JSON(http.StatusOK, out)
-}
-
 func toInstall(r store.Install) Install {
-	return Install{InstallID: r.InstallID, AppKey: r.AppKey, AppID: r.AppID, Platform: r.Platform, SDK: r.SDK,
+	return Install{InstallID: r.InstallID, AppID: r.AppID, Platform: r.Platform, SDK: r.SDK,
 		ResetReason: r.ResetReason, ConfirmedSeq: r.ConfirmedSeq, Counters: r.Counters(),
 		CreatedAt: r.CreatedAt.UTC(), UpdatedAt: r.UpdatedAt.UTC()}
 }
@@ -271,9 +190,6 @@ func (s *Server) handleInstalls(c *gin.Context) {
 			return
 		}
 		q = q.Where("install_id = ?", v)
-	}
-	if v := c.Query("app_key"); v != "" {
-		q = q.Where("app_key = ?", v)
 	}
 	if v := c.Query("platform"); v != "" {
 		if v != "android" && v != "ios" {
@@ -354,9 +270,6 @@ func (s *Server) handleReports(c *gin.Context) {
 	q := db.Table("reports AS r").Select("r.id, r.install_id, r.seq, r.client_ts, r.payload, r.received_at")
 	if v := c.Query("install_id"); v != "" {
 		q = q.Where("r.install_id = ?", v)
-	}
-	if v := c.Query("app_key"); v != "" { // reports表没有app_key，关联installs取
-		q = q.Joins("JOIN installs AS i ON i.install_id = r.install_id").Where("i.app_key = ?", v)
 	}
 	if v := c.Query("max_dt_ms"); v != "" { // 只看带有不超过该时长的测量的上传，传5000即含短测量
 		maxDt, err := strconv.ParseUint(v, 10, 64)

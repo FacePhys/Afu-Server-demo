@@ -12,7 +12,6 @@ import { fmtTime, rangeParams } from '../utils/time'
 
 interface FilterForm {
   install_id?: string
-  app_key?: string
   platform?: string
   reset_reason?: string
   created?: [Dayjs, Dayjs]
@@ -34,7 +33,6 @@ export default function Installs() {
         </span>
       ),
     },
-    { title: 'app_key', dataIndex: 'app_key' },
     { title: 'app_id', dataIndex: 'app_id' },
     { title: '平台', dataIndex: 'platform' },
     { title: 'sdk', dataIndex: 'sdk' },
@@ -64,16 +62,13 @@ export default function Installs() {
   ]
 
   const onFinish = ({ created, ...rest }: FilterForm) =>
-    setFilters({ ...rest, install_id: rest.install_id?.trim(), app_key: rest.app_key?.trim(), ...rangeParams(created) })
+    setFilters({ ...rest, install_id: rest.install_id?.trim(), ...rangeParams(created) })
 
   return (
     <Flex vertical gap={16}>
       <Form<FilterForm> layout="inline" onFinish={onFinish} style={{ rowGap: 12 }}>
         <Form.Item name="install_id">
           <Input placeholder="install_id" allowClear style={{ width: 300 }} />
-        </Form.Item>
-        <Form.Item name="app_key">
-          <Input placeholder="app_key" allowClear />
         </Form.Item>
         <Form.Item name="platform">
           <Select

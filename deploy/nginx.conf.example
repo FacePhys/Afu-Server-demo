@@ -1,0 +1,22 @@
+# SDK 必须走 HTTPS(iOS ATS、Android 9+ 默认禁止明文)：nginx 终止 TLS，只转发 /afu/v1/meter。
+# 内部后台(18081)不要经过这里对外暴露。
+server {
+    listen 443 ssl;
+    http2 on;
+    server_name 替换成域名;
+
+    ssl_certificate     /etc/nginx/certs/替换成证书.pem;
+    ssl_certificate_key /etc/nginx/certs/替换成证书私钥.key;
+
+    client_max_body_size 64k;   # 与 server.max_body_bytes 一致
+
+    location = /afu/v1/meter {
+        proxy_pass http://127.0.0.1:8080;
+        proxy_set_header Host $host;
+        proxy_read_timeout 10s;
+    }
+
+    location / {
+        return 404;
+    }
+}

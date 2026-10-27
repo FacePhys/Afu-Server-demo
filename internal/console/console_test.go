@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"regexp"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -171,5 +172,39 @@ func TestParseStatsRange(t *testing.T) {
 		if _, _, err := parseStatsRange(testContext(q), now, 30); err == nil {
 			t.Fatalf("%q 应报错", q)
 		}
+	}
+}
+
+func send(t *testing.T, h http.Handler, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+testToken)
+	w := httptest.NewRecorder()
+	h.ServeHTTP(w, req)
+	return w
+}
+
+func TestAppKeyValidation(t *testing.T) {
+	r := newTestServer(t, fstest.MapFS{}).Router()
+	const base = "/afu/internal/api/v1/app-keys"
+	cases := []struct {
+		method, path, body string
+		status             int
+	}{
+		{http.MethodPost, base, "{", 400},
+		{http.MethodPost, base, `{"app_key":"AK demo"}`, 400},                         // 含空格
+		{http.MethodPost, base, `{"app_key":"` + strings.Repeat("a", 65) + `"}`, 400}, // 超长
+		{http.MethodPost, base, `{"remark":"` + strings.Repeat("备", 256) + `"}`, 400},
+		{http.MethodPatch, base + "/abc", `{"status":"disabled"}`, 404},
+		{http.MethodPatch, base + "/1", `{"status":"deleted"}`, 400},
+		{http.MethodPatch, base + "/1", `{}`, 400},
+	}
+	for _, c := range cases {
+		if w := send(t, r, c.method, c.path, c.body); w.Code != c.status {
+			t.Fatalf("%s %s %s: %d %s", c.method, c.path, c.body, w.Code, w.Body)
+		}
+	}
+	if k := newAppKey(); !regexp.MustCompile(`^AK-[0-9a-f]{32}$`).MatchString(k) {
+		t.Fatalf("生成的格式 = %q", k)
 	}
 }

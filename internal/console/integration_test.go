@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"regexp"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -47,18 +48,10 @@ func setupDB(t *testing.T) *gorm.DB {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ddl, err := os.ReadFile("../../migrations/001_init.sql")
-	if err != nil {
+	if err := store.ApplyMigrations(db, "../../migrations"); err != nil {
 		t.Fatal(err)
 	}
-	for _, stmt := range strings.Split(string(ddl), ";\n") {
-		if strings.Contains(stmt, "CREATE TABLE") {
-			if err := db.Exec(stmt).Error; err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	for _, table := range []string{"installs", "reports", "measurements"} {
+	for _, table := range []string{"installs", "reports", "measurements", "app_keys"} {
 		if err := db.Exec("TRUNCATE TABLE " + table).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -153,27 +146,6 @@ func TestIntegrationDaily(t *testing.T) {
 			t.Fatalf("day %d = %+v, want %+v", i, d.Days[i], want[i])
 		}
 	}
-
-	d = getJSON[DailyStats](t, h, api+"/stats/daily?app_key=AK2&"+statsRange)
-	if d.Days[0].Measurements != 1 || d.Days[2].Measurements != 0 || d.Days[2].NewInstalls != 0 {
-		t.Fatalf("按app_key过滤 = %+v", d.Days)
-	}
-}
-
-func TestIntegrationAppKeys(t *testing.T) {
-	h, _ := setupServer(t)
-	s := getJSON[AppKeyStats](t, h, api+"/stats/app-keys?"+statsRange)
-	if len(s.Items) != 2 {
-		t.Fatalf("items = %+v", s.Items)
-	}
-	ak1, ak2 := s.Items[0], s.Items[1]
-	if ak1.AppKey != "AK1" || ak1.Installs != 2 || ak1.ActiveInstalls != 1 || ak1.Measurements != 2 ||
-		ak1.Frames != 450 || ak1.DtMs != 13966 || !ak1.LastReportAt.Equal(utc("2026-10-26T03:00:00Z")) {
-		t.Fatalf("AK1 = %+v", ak1)
-	}
-	if ak2.AppKey != "AK2" || ak2.Installs != 1 || ak2.Measurements != 1 || !ak2.LastReportAt.Equal(utc("2026-10-24T10:00:00Z")) {
-		t.Fatalf("AK2 = %+v", ak2)
-	}
 }
 
 func TestIntegrationInstalls(t *testing.T) {
@@ -190,7 +162,6 @@ func TestIntegrationInstalls(t *testing.T) {
 	}
 
 	filters := map[string][]string{
-		"app_key=AK1":                      {idB, idA},
 		"platform=ios":                     {idB},
 		"reset_reason=first":               {idA},
 		"reset_reason=unregistered":        {idC},
@@ -246,10 +217,9 @@ func TestIntegrationReports(t *testing.T) {
 func TestIntegrationReportFilters(t *testing.T) {
 	h, _ := setupServer(t)
 	cases := map[string][]string{
-		"max_dt_ms=5000":             {idA + ":2"}, // 只有A的seq=2带短测量
-		"app_key=AK2":                {idC + ":5"},
-		"app_key=AK1":                {idA + ":2", idA + ":1"},
-		"app_key=AK1&max_dt_ms=5000": {idA + ":2"},
+		"max_dt_ms=5000":                        {idA + ":2"}, // 只有A的seq=2带短测量
+		"install_id=" + idC:                     {idC + ":5"},
+		"install_id=" + idA + "&max_dt_ms=5000": {idA + ":2"},
 	}
 	for q, want := range cases {
 		p := getJSON[Page[Report]](t, h, api+"/reports?"+q)
@@ -261,8 +231,10 @@ func TestIntegrationReportFilters(t *testing.T) {
 			t.Fatalf("%s: got %v, want %v", q, got, want)
 		}
 	}
-	if w := get(t, h, api+"/measurements", testToken); w.Code != http.StatusNotFound {
-		t.Fatalf("/measurements 已删除，应返回404: %d", w.Code)
+	for _, path := range []string{"/measurements", "/stats/app-keys"} { // 已删除的接口
+		if w := get(t, h, api+path, testToken); w.Code != http.StatusNotFound {
+			t.Fatalf("%s 应返回404: %d", path, w.Code)
+		}
 	}
 }
 
@@ -287,4 +259,47 @@ func TestIntegrationBadParams(t *testing.T) {
 func itoa(v uint64) string {
 	b, _ := json.Marshal(v)
 	return string(b)
+}
+
+func TestIntegrationAppKeys(t *testing.T) {
+	h, db := setupServer(t)
+	const base = api + "/app-keys"
+
+	w := send(t, h, http.MethodPost, base, `{"remark":"阿福正式环境"}`)
+	var gen AppKey
+	json.Unmarshal(w.Body.Bytes(), &gen)
+	if w.Code != http.StatusCreated || !regexp.MustCompile(`^AK-[0-9a-f]{32}$`).MatchString(gen.AppKey) ||
+		gen.Status != "enabled" || gen.CreatedBy != "alice" || gen.Remark != "阿福正式环境" || gen.CreatedAt.IsZero() {
+		t.Fatalf("生成: %d %s", w.Code, w.Body)
+	}
+
+	w = send(t, h, http.MethodPost, base, `{"app_key":"AK-demo","remark":"导入"}`)
+	var imported AppKey
+	json.Unmarshal(w.Body.Bytes(), &imported)
+	if w.Code != http.StatusCreated || imported.AppKey != "AK-demo" {
+		t.Fatalf("导入: %d %s", w.Code, w.Body)
+	}
+	if w = send(t, h, http.MethodPost, base, `{"app_key":"AK-demo"}`); w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "app_key_exists") {
+		t.Fatalf("重复导入: %d %s", w.Code, w.Body)
+	}
+
+	list := getJSON[AppKeyList](t, h, base)
+	if len(list.Items) != 2 || list.Items[0].AppKey != "AK-demo" {
+		t.Fatalf("列表(新的在前) = %+v", list.Items)
+	}
+
+	w = send(t, h, http.MethodPatch, base+"/"+itoa(imported.ID), `{"status":"disabled","remark":"已停用"}`)
+	var upd AppKey
+	json.Unmarshal(w.Body.Bytes(), &upd)
+	if w.Code != http.StatusOK || upd.Status != "disabled" || upd.Remark != "已停用" {
+		t.Fatalf("停用: %d %s", w.Code, w.Body)
+	}
+	var k store.AppKey
+	db.Where("app_key = ?", "AK-demo").Take(&k)
+	if k.Status != store.AppKeyDisabled {
+		t.Fatalf("库里状态 = %q", k.Status)
+	}
+	if w = send(t, h, http.MethodPatch, base+"/999999", `{"status":"enabled"}`); w.Code != http.StatusNotFound {
+		t.Fatalf("不存在: %d", w.Code)
+	}
 }

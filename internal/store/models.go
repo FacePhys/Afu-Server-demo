@@ -96,3 +96,21 @@ func ToMeasurements(installID string, seq uint64, ms []protocol.Measurement) []M
 	}
 	return out
 }
+
+const (
+	AppKeyEnabled  = "enabled"
+	AppKeyDisabled = "disabled"
+)
+
+// AppKey 由内部后台生成或导入，注册、上报带的 app_key 必须存在且已启用。
+type AppKey struct {
+	ID        uint64    `gorm:"column:id;primaryKey"`
+	AppKey    string    `gorm:"column:app_key"`
+	Remark    string    `gorm:"column:remark"`
+	Status    string    `gorm:"column:status"`
+	CreatedBy string    `gorm:"column:created_by"`
+	CreatedAt time.Time `gorm:"column:created_at"`
+	UpdatedAt time.Time `gorm:"column:updated_at"`
+}
+
+func (AppKey) TableName() string { return "app_keys" }

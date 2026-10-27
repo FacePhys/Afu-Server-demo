@@ -23,6 +23,7 @@
 6. 上报失败重试时seq和明文内容不变，只重新加密；服务端收到已处理过的seq，直接按当前状态重新返回ack，不重复扣费。
 7. 服务端换号：注册时install_id已存在(reason = conflict)，或上报时服务端没有该install_id(reason = unregistered)，服务端都会生成新的install_id并直接注册，返回refused：install_id字段就是新编号，其余字段和ack一样带上seq和cap。客户端收到后把这次请求视为服务端已收到，不再重发；替换成新编号，直接按refused中的cap继续使用，不需要发空上报；计数和seq接着用，不要再发register(会被再次换号)。
 8. 唯一性只看install_id；app_key、app_id同一个客户的所有客户端都相同，不参与判断。
+9. App Key 由我方在内部后台生成(或导入)并存库，发给客户；注册、上报带的 app_key 必须是已启用的 App Key，否则返回明文 403 invalid_app_key，数据不入库。
 
 ## 通用约定
 
@@ -37,11 +38,12 @@
 | 请求type | register：注册；report：用量上报                   |
 | 响应type | ack：成功；refused：服务端已换号(编号冲突或未注册) |
 
-| 情况           | http状态码 | 响应体                             |
-| -------------- | ---------- | ---------------------------------- |
-| ack或refused   | 200        | 外层明文json，业务内容在加密的ct中 |
-| 协议错误       | 400        | 明文json，不加密，见「错误响应」   |
-| 服务端内部错误 | 500        | 明文json，不加密，见「错误响应」   |
+| 情况                   | http状态码 | 响应体                             |
+| ---------------------- | ---------- | ---------------------------------- |
+| ack或refused           | 200        | 外层明文json，业务内容在加密的ct中 |
+| 协议错误               | 400        | 明文json，不加密，见「错误响应」   |
+| app_key 不存在或已停用 | 403        | 明文json，不加密，见「错误响应」   |
+| 服务端内部错误         | 500        | 明文json，不加密，见「错误响应」   |
 
 请求体样例：
 
@@ -105,7 +107,7 @@
 
 ### 错误响应
 
-协议层错误(服务端无法解密请求，或解密后的明文不合法)返回http 400 + 明文json，不加密：
+协议层错误(服务端无法解密请求，或解密后的明文不合法)返回http 4xx + 明文json，不加密；app_key 不存在或已停用为403，其余为400：
 
 ```json
 {"code": "decrypt_failed", "msg": "decrypt failed"}
@@ -119,6 +121,7 @@
 | unknown_kid         | kid不存在                                                                                                             |
 | decrypt_failed      | rsa解密失败或GCM tag校验失败；两种情况返回完全相同的code和msg，防止被当作padding oracle利用                           |
 | bad_payload         | 解密成功，但明文不是合法json，或字段缺失、类型错误、取值非法                                                          |
+| invalid_app_key     | 解密成功，但 app_key 不存在或已停用；http状态码为403                                                                  |
 
 服务端内部错误返回http 500 + `{"code": "internal_error", "msg": "internal error"}`。
 
@@ -151,7 +154,7 @@
 | 字段       | 说明                                                                                                                                                                                                          | 样例                             |
 | ---------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
 | install_id | 安装编号：SDK 随机生成                                                                                                                                                                                        | ebedf529617fd42a433665cfd9150d46 |
-| app_key    | 我方发给客户的 App Key（阿福在 meter_open 时传入）                                                                                                                                                            | AK-demo                          |
+| app_key    | 我方发给客户的 App Key（阿福在 meter_open 时传入），必须是服务端已启用的 App Key                                                                                                                              | AK-demo                          |
 | app_id     | 包名或 Bundle ID，SDK 自己读取                                                                                                                                                                                | com.example.app                  |
 | sdk        | sdk版本                                                                                                                                                                                                       | 1.1.0-beta.1                     |
 | platform   | 平台：android / ios                                                                                                                                                                                           | android                          |
@@ -253,28 +256,28 @@
 
 > 明文字段描述(ct解密后)
 
-| 字段                    | 说明                                                   | 样例                             |
-| ----------------------- | ------------------------------------------------------ | -------------------------------- |
-| install_id              | 安装编号：SDK 随机生成                                 | ebedf529617fd42a433665cfd9150d46 |
-| app_key                 | 同注册；服务端没有该编号、需要自动注册时使用           | AK-demo                          |
-| app_id                  | 同注册；用途同上                                       | com.example.app                  |
-| platform                | 同注册；用途同上                                       | android                          |
-| seq                     | 序号，每份加 1：去重、防重放、发现丢包；失败重试时不变 | 1                                |
-| ts                      | 生成时间（Unix 毫秒）                                  | 1792478748241                    |
-| sdk                     | sdk版本                                                | 1.1.0-beta.1                     |
-| counters.sessions       | 测量次数（累计）                                       | 1                                |
-| counters.frames_ok      | 有效帧数（累计，计费）                                 | 300                              |
-| counters.dt_ms          | 测量时长，毫秒（累计，计费）                           | 9966                             |
-| counters.mono_ms        | 同一时长按 SDK 时钟测（对照时间戳是否造假）            | 9968                             |
-| counters.run_ok         | run 次数（累计，计费）                                 | 10                               |
-| counters.gated_frames   | 被闸门拒绝的帧数（累计）                               | 1                                |
-| counters.gated_runs     | 被闸门拒绝的 run 次数（累计）                          | 0                                |
-| measurements            | 数组：本次上报的测量，正常 1 条；空上报时为空数组      | [{…}]                            |
-| measurements[].no       | 单次编号：第几次测量（最后一条 = counters.sessions）   | 1                                |
-| measurements[].start_ts | 单次开始测量时间：第一帧被接受（Unix 毫秒）            | 1792478738236                    |
-| measurements[].end_ts   | 单次结束测量时间：最后一帧被接受（Unix 毫秒）          | 1792478748205                    |
-| measurements[].frames   | 这次测量的有效帧数                                     | 300                              |
-| measurements[].dt_ms    | 这次测量的时长，毫秒（算法同 counters.dt_ms）          | 9966                             |
+| 字段                    | 说明                                                                         | 样例                             |
+| ----------------------- | ---------------------------------------------------------------------------- | -------------------------------- |
+| install_id              | 安装编号：SDK 随机生成                                                       | ebedf529617fd42a433665cfd9150d46 |
+| app_key                 | 同注册，必须是服务端已启用的 App Key；服务端没有该编号、需要自动注册时也用它 | AK-demo                          |
+| app_id                  | 同注册；用途同上                                                             | com.example.app                  |
+| platform                | 同注册；用途同上                                                             | android                          |
+| seq                     | 序号，每份加 1：去重、防重放、发现丢包；失败重试时不变                       | 1                                |
+| ts                      | 生成时间（Unix 毫秒）                                                        | 1792478748241                    |
+| sdk                     | sdk版本                                                                      | 1.1.0-beta.1                     |
+| counters.sessions       | 测量次数（累计）                                                             | 1                                |
+| counters.frames_ok      | 有效帧数（累计，计费）                                                       | 300                              |
+| counters.dt_ms          | 测量时长，毫秒（累计，计费）                                                 | 9966                             |
+| counters.mono_ms        | 同一时长按 SDK 时钟测（对照时间戳是否造假）                                  | 9968                             |
+| counters.run_ok         | run 次数（累计，计费）                                                       | 10                               |
+| counters.gated_frames   | 被闸门拒绝的帧数（累计）                                                     | 1                                |
+| counters.gated_runs     | 被闸门拒绝的 run 次数（累计）                                                | 0                                |
+| measurements            | 数组：本次上报的测量，正常 1 条；空上报时为空数组                            | [{…}]                            |
+| measurements[].no       | 单次编号：第几次测量（最后一条 = counters.sessions）                         | 1                                |
+| measurements[].start_ts | 单次开始测量时间：第一帧被接受（Unix 毫秒）                                  | 1792478738236                    |
+| measurements[].end_ts   | 单次结束测量时间：最后一帧被接受（Unix 毫秒）                                | 1792478748205                    |
+| measurements[].frames   | 这次测量的有效帧数                                                           | 300                              |
+| measurements[].dt_ms    | 这次测量的时长，毫秒（算法同 counters.dt_ms）                                | 9966                             |
 
 > counters中的sessions、frames_ok、dt_ms、mono_ms、run_ok只累计时长超过5秒的测量
 
@@ -390,8 +393,9 @@ sequenceDiagram
 
 > 唯一性只看install_id；app_key、app_id同一个客户的所有客户端都相同，不参与判断
 
+0. app_key 不存在或已停用：返回明文 403 invalid_app_key，不入库。
 1. 按install_id查安装记录，不存在：
-   1. 校验app_key、app_id(规则随计费细则同步，先留桩放行)。
+   1. 校验app_id(规则随计费细则同步，先留桩放行)。
    2. 写入安装记录，已确认seq = 0，已确认counters全为0。install_id唯一，并发写入冲突时按「已存在」处理。
    3. 按「cap计算」得到cap，返回ack(seq = 0)。
 2. 已存在(换号时不记录旧编号；refused丢失时客户端拿旧编号重试，会再换一次号，上一次换出的记录不再使用)：
@@ -401,9 +405,10 @@ sequenceDiagram
 
 ### 上报处理
 
+0. app_key 不存在或已停用：返回明文 403 invalid_app_key，不入库。
 1. 按install_id查安装记录。
 2. 查不到：自动注册新编号，完成后直接返回，不走后面的步骤(换号时不记录旧编号；refused丢失时客户端拿旧编号重试，会再换一次号，上一次换出的记录不再使用)：
-   1. 校验app_key、app_id(规则随计费细则同步，先留桩放行)。
+   1. 校验app_id(规则随计费细则同步，先留桩放行)。
    2. 生成新的install_id(32位小写hex随机数，与客户端生成的格式一致)。
    3. 写入安装记录：app_key、app_id、platform、sdk取自本次上报，reset = unregistered，已确认seq = 本次seq，已确认counters = 本次counters(作为基线，历史用量不重复扣费)。
    4. 保存本次上报和measurements；触发换号的这次测量是否计费随计费细则定(留桩)；如果计费，refused丢失重试再换号时会再扣一次。
@@ -432,6 +437,7 @@ sequenceDiagram
 | -------------------- | ------------------------------------------------------------------------------------------------------ | ------------------------------------ |
 | rsa密钥              | kid、私钥、状态(启用 / 下线)                                                                           | 私钥放配置或密钥管理服务，不放业务库 |
 | 安装记录             | install_id(唯一)、app_key、app_id、platform、sdk、reset、注册时间、已确认seq、已确认counters、更新时间 | 每个install一条                      |
+| App Key              | app_key(唯一，区分大小写)、备注、状态(启用 / 停用)、创建人、创建时间                                   | 内部后台生成或导入                   |
 | 上报记录             | install_id + seq(唯一)、ts、原始明文json、接收时间                                                     | 对账、审计                           |
 | 测量记录             | install_id + no(唯一)、start_ts、end_ts、frames、dt_ms                                                 | 单次测量明细                         |
 | 客户、额度、扣费流水 | 随计费细则同步                                                                                         | 留桩                                 |

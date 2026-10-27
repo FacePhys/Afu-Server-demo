@@ -33,10 +33,12 @@
 │   ├── store/                # MySQL读写
 │   └── console/              # 内部数据后台的只读接口，见 docs/internal-console.md
 ├── web/                      # 内部数据后台前端(React + Ant Design)，构建产物打进二进制
-├── migrations/001_init.sql   # 建表
+├── migrations/               # 建表：001_init.sql、002_app_keys.sql，按文件名顺序执行
 ├── configs/config.example.yaml
 ├── keys/                     # 本地私钥，不提交
 ├── docker-compose.yml        # 本地MySQL
+├── Dockerfile                # 多阶段构建：前端 → Go交叉编译 → alpine运行镜像
+├── deploy/                   # 生产部署：docker-compose、配置模板、密钥/Token脚本、nginx示例、部署说明
 ├── Makefile
 └── go.mod                    # module github.com/FacePhys/Afu-Server-demo
 ```
@@ -78,7 +80,7 @@ log:
 
 ## 数据库
 
-`migrations/001_init.sql`(用 `IF NOT EXISTS`，重复执行不报错，集成测试也直接执行它建表)：
+`migrations/001_init.sql`(用 `IF NOT EXISTS`，重复执行不报错；集成测试用 `store.ApplyMigrations` 按文件名顺序执行全部迁移文件建表)：
 
 ```sql
 CREATE TABLE IF NOT EXISTS installs (
@@ -128,7 +130,8 @@ CREATE TABLE IF NOT EXISTS measurements (
 ```
 
 1. 列名避开MySQL关键字：`reset` → `reset_reason`，`no` → `measure_no`。
-2. 客户、额度、扣费流水的表等计费细则同步后再设计，现在不建。
+2. App Key 表在 `migrations/002_app_keys.sql`(app_key 列用 utf8mb4_bin，区分大小写)，由内部后台生成或导入。
+3. 客户、额度、扣费流水的表等计费细则同步后再设计，现在不建。
 3. 写measurements要忽略重复的no：`Clauses(clause.OnConflict{DoNothing: true})`，在MySQL下生成 `ON DUPLICATE KEY UPDATE id=id`。不要用 `INSERT IGNORE`，它会把截断等其他错误也吞掉。
 4. 唯一键冲突判断：开启 `TranslateError` 后用 `errors.Is(err, gorm.ErrDuplicatedKey)`，驱动会把MySQL错误码1062转换成它。
 5. `reports.payload` 在Go模型里用 `string`，不要用 `[]byte`：驱动按binary字符集发送 `[]byte`，写JSON列会报错3144。
@@ -300,15 +303,15 @@ type Refused struct {
 
 ### 字段校验(不通过返回 bad_payload)
 
-| 字段                 | 规则                                                                      |
-| -------------------- | ------------------------------------------------------------------------- |
-| install_id           | 32位小写hex                                                               |
-| app_key、app_id、sdk | 非空，长度不超过列宽(64 / 255 / 32)；上报也必填(自动注册要用)             |
-| platform             | android / ios                                                             |
-| reset                | 空、corrupt、conflict、unregistered之一(后两个客户端不会发，收到也不拒绝) |
-| ts                   | 大于0                                                                     |
-| seq(上报)            | 大于等于1                                                                 |
-| measurements         | 最多16条(防御性上限)；每条no大于等于1、end_ts大于等于start_ts             |
+| 字段                 | 规则                                                                                                                                             |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------ |
+| install_id           | 32位小写hex                                                                                                                                      |
+| app_key、app_id、sdk | 非空，长度不超过列宽(64 / 255 / 32)；上报也必填(自动注册要用)；app_key 还要在 app_keys 表里且已启用，否则返回403 invalid_app_key(业务层查库校验) |
+| platform             | android / ios                                                                                                                                    |
+| reset                | 空、corrupt、conflict、unregistered之一(后两个客户端不会发，收到也不拒绝)                                                                        |
+| ts                   | 大于0                                                                                                                                            |
+| seq(上报)            | 大于等于1                                                                                                                                        |
+| measurements         | 最多16条(防御性上限)；每条no大于等于1、end_ts大于等于start_ts                                                                                    |
 
 1. 计数类字段是 `uint64`，传负数会在json解析时失败，同样返回bad_payload。
 2. 明文里出现未知字段不报错，方便客户端先加字段。
@@ -330,6 +333,7 @@ var (
 	ErrUnknownKid         = &Error{400, "unknown_kid", "unknown kid"}
 	ErrDecryptFailed      = &Error{400, "decrypt_failed", "decrypt failed"} // rsa、gcm失败都用它，msg固定
 	ErrBadPayload         = &Error{400, "bad_payload", "bad payload"}
+	ErrInvalidAppKey      = &Error{403, "invalid_app_key", "invalid app key"} // app_key 不存在或已停用
 	ErrInternal           = &Error{500, "internal_error", "internal error"}
 )
 ```
@@ -493,6 +497,9 @@ func (h *Handler) Meter(c *gin.Context) {
 
 ```go
 func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (string, any, error) {
+	if err := s.checkAppKey(ctx, req.InstallID, req.AppKey); err != nil { // 不存在或已停用：403，不入库
+		return "", nil, err
+	}
 	if err := s.billing.ValidateApp(ctx, req.AppKey, req.AppID); err != nil { // 留桩：放行
 		return "", nil, err
 	}
@@ -677,14 +684,16 @@ services:
 
 `Makefile` 目标：
 
-| 目标         | 作用                                                                                               |
-| ------------ | -------------------------------------------------------------------------------------------------- |
-| `make db`    | `docker compose up -d mysql`                                                                       |
-| `make keys`  | 按「密钥生成」生成kid1的私钥和两种公钥；`keys/kid1.pem` 已存在时不覆盖，避免已发给客户端的公钥失效 |
-| `make run`   | `go run ./cmd/server -config configs/config.yaml`                                                  |
-| `make test`  | `go test ./...`(不连数据库)                                                                        |
-| `make itest` | 设置 `AFU_TEST_DSN` 后跑集成测试                                                                   |
-| `make lint`  | `go vet ./...`                                                                                     |
+| 目标           | 作用                                                                                                    |
+| -------------- | ------------------------------------------------------------------------------------------------------- |
+| `make db`      | `docker compose up -d mysql`                                                                            |
+| `make keys`    | 按「密钥生成」生成kid1的私钥和两种公钥；`keys/kid1.pem` 已存在时不覆盖，避免已发给客户端的公钥失效      |
+| `make run`     | `go run ./cmd/server -config configs/config.yaml`                                                       |
+| `make test`    | `go test ./...`(不连数据库)                                                                             |
+| `make itest`   | 设置 `AFU_TEST_DSN` 后跑集成测试                                                                        |
+| `make lint`    | `go vet ./...`                                                                                          |
+| `make image`   | 构建Docker镜像(默认 linux/amd64，本机交叉编译)，版本号取git提交号                                       |
+| `make package` | 打部署包到 `release/`：镜像 + docker-compose + 配置模板 + 建表SQL + 脚本，部署步骤见 `deploy/README.md` |
 
 ## 测试
 
@@ -703,17 +712,18 @@ services:
 
 > 测试会清空 installs、reports、measurements 三张表，`AFU_TEST_DSN` 必须指向专用测试库。
 
-| 场景                   | 期望                                              |
-| ---------------------- | ------------------------------------------------- |
-| 新install_id注册       | ack，seq = 0，cap = 单次测量额度                  |
-| 已存在的install_id注册 | refused(conflict)，install_id为新编号且已入库     |
-| 正常上报               | ack，已确认seq和counters更新                      |
-| 重复seq                | ack，不新增reports行，不调用Charge                |
-| 计数变小               | 已确认counters不变，增量按0，记录异常日志         |
-| 空上报                 | ack，增量为0                                      |
-| 未知install_id上报     | refused(unregistered)，新记录以本次counters为基线 |
-| 同一install_id并发上报 | 串行处理，只扣一次                                |
-| 桩切成「无额度」       | cap = 已确认counters                              |
+| 场景                               | 期望                                              |
+| ---------------------------------- | ------------------------------------------------- |
+| app_key 不存在、已停用、大小写不同 | 403 invalid_app_key，不入库、不扣费               |
+| 新install_id注册                   | ack，seq = 0，cap = 单次测量额度                  |
+| 已存在的install_id注册             | refused(conflict)，install_id为新编号且已入库     |
+| 正常上报                           | ack，已确认seq和counters更新                      |
+| 重复seq                            | ack，不新增reports行，不调用Charge                |
+| 计数变小                           | 已确认counters不变，增量按0，记录异常日志         |
+| 空上报                             | ack，增量为0                                      |
+| 未知install_id上报                 | refused(unregistered)，新记录以本次counters为基线 |
+| 同一install_id并发上报             | 串行处理，只扣一次                                |
+| 桩切成「无额度」                   | cap = 已确认counters                              |
 
 ### 端到端
 

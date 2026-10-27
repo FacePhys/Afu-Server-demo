@@ -50,7 +50,6 @@ export default function InstallDetail() {
           title={<IdText id={d.install_id} />}
           column={{ xs: 1, md: 3 }}
           items={[
-            { label: 'app_key', children: d.app_key },
             { label: 'app_id', children: d.app_id },
             { label: '平台', children: d.platform },
             { label: 'sdk', children: d.sdk },

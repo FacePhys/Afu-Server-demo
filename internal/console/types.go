@@ -65,23 +65,8 @@ type DayStat struct {
 	DtMs         uint64 `json:"dt_ms"`
 }
 
-type AppKeyStats struct {
-	Items []AppKeyStat `json:"items"`
-}
-
-type AppKeyStat struct {
-	AppKey         string     `json:"app_key"`
-	Installs       int64      `json:"installs"`
-	ActiveInstalls int64      `json:"active_installs"`
-	Measurements   int64      `json:"measurements"`
-	Frames         uint64     `json:"frames"`
-	DtMs           uint64     `json:"dt_ms"`
-	LastReportAt   *time.Time `json:"last_report_at"` // 从没上报过时为null
-}
-
 type Install struct {
 	InstallID    string            `json:"install_id"`
-	AppKey       string            `json:"app_key"`
 	AppID        string            `json:"app_id"`
 	Platform     string            `json:"platform"`
 	SDK          string            `json:"sdk"`

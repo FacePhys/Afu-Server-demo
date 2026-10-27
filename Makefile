@@ -1,6 +1,12 @@
 CONFIG ?= configs/config.yaml
+# 镜像版本：git提交号，有未提交改动时带 -dirty
+VERSION ?= $(shell git describe --always --dirty 2>/dev/null || echo dev)
+PLATFORM ?= linux/amd64
+IMAGE ?= afu-server:$(VERSION)
+ARCH_SUFFIX := $(subst /,-,$(PLATFORM))
+RELEASE_NAME := afu-server-$(VERSION)
 
-.PHONY: db keys admin-token run build build-go web web-dev test itest lint fakeclient
+.PHONY: db keys admin-token run build build-go web web-dev test itest lint fakeclient image package
 
 db:
 	docker compose up -d mysql
@@ -50,3 +56,18 @@ lint:
 
 fakeclient:
 	go run ./cmd/fakeclient
+
+# 构建 Docker 镜像(默认 linux/amd64，在本机交叉编译)
+image:
+	docker buildx build --platform $(PLATFORM) --build-arg VERSION=$(VERSION) -t $(IMAGE) --load .
+
+# 打部署包：镜像 + docker-compose + 配置模板 + 建表SQL + 脚本，输出到 release/
+package: image
+	rm -rf release/$(RELEASE_NAME) && mkdir -p release/$(RELEASE_NAME)/migrations
+	docker save $(IMAGE) | gzip > release/$(RELEASE_NAME)/$(RELEASE_NAME)-$(ARCH_SUFFIX).image.tar.gz
+	cp deploy/docker-compose.yml deploy/.env.example deploy/config.yaml.example deploy/gen-keys.sh \
+	   deploy/gen-admin-token.sh deploy/nginx.conf.example deploy/README.md release/$(RELEASE_NAME)/
+	cp migrations/*.sql release/$(RELEASE_NAME)/migrations/
+	sed -i.bak 's/^AFU_VERSION=.*/AFU_VERSION=$(VERSION)/' release/$(RELEASE_NAME)/.env.example && rm release/$(RELEASE_NAME)/.env.example.bak
+	tar -C release -czf release/$(RELEASE_NAME)-$(ARCH_SUFFIX).tar.gz $(RELEASE_NAME)
+	@echo "部署包：release/$(RELEASE_NAME)-$(ARCH_SUFFIX).tar.gz"

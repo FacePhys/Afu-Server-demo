@@ -31,8 +31,19 @@ export async function apiGet<T>(path: string, params?: Params, opts: Options = {
   for (const [k, v] of Object.entries(params ?? {})) {
     if (v !== undefined && v !== null && v !== '' && v !== false) url.searchParams.set(k, String(v))
   }
+  return request<T>(url, 'GET', undefined, opts)
+}
+
+/** 写接口(目前只有 App Key 管理)：json请求体 */
+export async function apiSend<T>(method: 'POST' | 'PATCH', path: string, body: unknown): Promise<T> {
+  return request<T>(new URL(API_PREFIX + path, window.location.origin), method, body, {})
+}
+
+async function request<T>(url: URL, method: string, payload: unknown, opts: Options): Promise<T> {
   const token = opts.token ?? tokenStore.get() ?? ''
-  const resp = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+  const headers: Record<string, string> = { Authorization: `Bearer ${token}` }
+  if (payload !== undefined) headers['Content-Type'] = 'application/json'
+  const resp = await fetch(url, { method, headers, body: payload === undefined ? undefined : JSON.stringify(payload) })
 
   if (resp.status === 401 && (opts.redirectOn401 ?? true)) {
     tokenStore.clear()
@@ -54,6 +65,8 @@ export function errorText(e: unknown): string {
         return '记录不存在'
       case 'unauthorized':
         return '登录已失效'
+      case 'app_key_exists':
+        return '这个 App Key 已经存在'
       default:
         return `请求失败：${e.code}`
     }

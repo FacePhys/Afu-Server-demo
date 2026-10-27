@@ -30,6 +30,9 @@ type reportResult struct {
 // Report 处理上报：一个事务完成，按install_id加行锁串行处理。
 // 隔离级别用 READ COMMITTED：FOR UPDATE 查不到行时不加间隙锁，避免并发换号时死锁。
 func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte) (string, any, error) {
+	if err := s.checkAppKey(ctx, req.InstallID, req.AppKey); err != nil {
+		return "", nil, err
+	}
 	for _, m := range req.Measurements {
 		if m.DtMs <= minBilledDtMs { // 不拒绝，拒绝会让客户端一直重试同一份上报
 			s.log.Warn("measurement not longer than 5s", "install_id", req.InstallID, "seq", req.Seq, "no", m.No, "dt_ms", m.DtMs)

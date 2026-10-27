@@ -192,3 +192,12 @@ func TestInternalErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestInvalidAppKeyIs403(t *testing.T) {
+	k := key(t)
+	ct, _, _ := envelope.SealRequest(&k.PublicKey, 1, 1, protocol.TypeRegister, registerPlain())
+	w := do(t, newRouter(t, &fakeService{err: protocol.ErrInvalidAppKey}), envelopeJSON(t, 1, 1, protocol.TypeRegister, ct))
+	if w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), `"invalid_app_key"`) {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+	}
+}

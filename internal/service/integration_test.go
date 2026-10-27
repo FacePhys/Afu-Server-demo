@@ -6,7 +6,6 @@ import (
 	"io"
 	"log/slog"
 	"os"
-	"strings"
 	"sync"
 	"testing"
 
@@ -55,21 +54,16 @@ func setup(t *testing.T) (*Service, *countingBilling, *gorm.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	ddl, err := os.ReadFile("../../migrations/001_init.sql")
-	if err != nil {
+	if err := store.ApplyMigrations(db, "../../migrations"); err != nil {
 		t.Fatal(err)
 	}
-	for _, stmt := range strings.Split(string(ddl), ";\n") {
-		if strings.Contains(stmt, "CREATE TABLE") {
-			if err := db.Exec(stmt).Error; err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	for _, table := range []string{"installs", "reports", "measurements"} {
+	for _, table := range []string{"installs", "reports", "measurements", "app_keys"} {
 		if err := db.Exec("TRUNCATE TABLE " + table).Error; err != nil {
 			t.Fatal(err)
 		}
+	}
+	if err := db.Create(&store.AppKey{AppKey: "AK-demo", Status: store.AppKeyEnabled}).Error; err != nil {
+		t.Fatal(err)
 	}
 	b := &countingBilling{}
 	return New(db, b, billing.LogNotifier{Log: log}, meterCfg, log), b, db
@@ -274,5 +268,36 @@ func TestIntegrationConcurrentReport(t *testing.T) {
 	}
 	if b.chargeCount() != 1 || count(t, db, &store.Report{}, "install_id = ?", testInstallID) != 1 {
 		t.Fatalf("charges = %d，应只扣一次", b.chargeCount())
+	}
+}
+
+func TestIntegrationInvalidAppKey(t *testing.T) {
+	s, b, db := setup(t)
+	ctx := context.Background()
+
+	reg := registerReq(testInstallID)
+	reg.AppKey = "AK-other"
+	if _, _, err := s.Register(ctx, reg); err != protocol.ErrInvalidAppKey {
+		t.Fatalf("注册: %v", err)
+	}
+	rep := reportReq(testInstallID, 1, 300, 10)
+	rep.AppKey = "AK-other"
+	if _, _, err := s.Report(ctx, rep, raw(t, rep)); err != protocol.ErrInvalidAppKey {
+		t.Fatalf("上报: %v", err)
+	}
+	if n := count(t, db, &store.Install{}, "1 = 1"); n != 0 || b.chargeCount() != 0 {
+		t.Fatalf("app_key 不存在时不应入库或扣费: installs=%d", n)
+	}
+
+	// 停用后同样拒绝；区分大小写
+	if err := db.Model(&store.AppKey{}).Where("app_key = ?", "AK-demo").Update("status", store.AppKeyDisabled).Error; err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := s.Register(ctx, registerReq(testInstallID)); err != protocol.ErrInvalidAppKey {
+		t.Fatalf("已停用: %v", err)
+	}
+	reg.AppKey = "ak-demo"
+	if _, _, err := s.Register(ctx, reg); err != protocol.ErrInvalidAppKey {
+		t.Fatalf("大小写不同: %v", err)
 	}
 }

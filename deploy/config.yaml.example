@@ -1,0 +1,32 @@
+# 生产配置模板：复制为 config.yaml，按「部署说明」填写 admin.tokens 后再启动
+server:
+  addr: ":8080"
+  max_body_bytes: 65536
+  read_timeout: 5s
+  write_timeout: 5s
+
+db:
+  dsn: "由环境变量 AFU_DB_DSN 覆盖，见 .env"
+  max_open_conns: 50
+  max_idle_conns: 10
+
+keys:                           # 私钥放在 keys/ 目录，见 gen-keys.sh
+  - kid: 1
+    private_key_file: "/app/keys/kid1.pem"
+    status: active
+
+meter:
+  per_measure_frames: 300       # 单次测量额度(帧)，等算法给值
+  per_measure_runs: 10
+  ttl_sec: 86400
+  report_sec: 60
+
+log:
+  level: info
+
+admin:                          # 内部数据后台
+  addr: ":18081"                # 容器内监听；宿主机只映射到 127.0.0.1，见 docker-compose.yml
+  db_dsn: ""                    # 建议换成只读账号的DSN；留空时复用 AFU_DB_DSN
+  tokens:                       # 用 gen-admin-token.sh 生成，按人添加
+    - name: "替换成使用人"
+      token_sha256: "替换成gen-admin-token.sh打印的SHA-256"

@@ -13,6 +13,9 @@ import (
 // Register 处理注册：不先查再插，直接插入，用唯一键判断install_id是否已存在，天然处理并发。
 // 已存在时换号(不记录旧编号)，返回refused(conflict)。
 func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (string, any, error) {
+	if err := s.checkAppKey(ctx, req.InstallID, req.AppKey); err != nil {
+		return "", nil, err
+	}
 	if err := s.billing.ValidateApp(ctx, req.AppKey, req.AppID); err != nil { // 留桩：放行
 		return "", nil, err
 	}

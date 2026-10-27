@@ -1,0 +1,47 @@
+# 生产部署：afu 服务 + MySQL(数据持久化到 mysql-data 卷)。
+# 以后换云数据库：改 .env 里的 AFU_DB_DSN，删掉下面的 mysql 服务和 afu 的 depends_on。
+# 项目名固定为 afu：升级时换了解压目录，数据卷(afu_mysql-data)也不会变成新的空卷。
+name: afu
+
+services:
+  mysql:
+    image: mysql:8.4
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 里设置 MYSQL_ROOT_PASSWORD}
+      MYSQL_DATABASE: afu
+      MYSQL_USER: afu
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?请在 .env 里设置 MYSQL_PASSWORD}
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./migrations:/docker-entrypoint-initdb.d:ro   # 首次启动(数据卷为空)时自动建表
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uroot -p$$MYSQL_ROOT_PASSWORD --silent"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging: &logging
+      driver: json-file
+      options:
+        max-size: "50m"
+        max-file: "5"
+    # 不对宿主机暴露端口；维护时用 docker compose exec mysql mysql -uroot -p
+
+  afu:
+    image: afu-server:${AFU_VERSION:?请在 .env 里设置 AFU_VERSION}
+    restart: unless-stopped
+    depends_on:
+      mysql:
+        condition: service_healthy
+    environment:
+      AFU_DB_DSN: ${AFU_DB_DSN:?请在 .env 里设置 AFU_DB_DSN}
+    ports:
+      - "${AFU_HTTP_BIND:-127.0.0.1}:${AFU_HTTP_PORT:-8080}:8080"   # SDK上报：默认只给本机nginx访问；用云负载均衡时 AFU_HTTP_BIND=0.0.0.0
+      - "127.0.0.1:${AFU_ADMIN_PORT:-18081}:18081"                 # 内部后台只绑宿主机本地，用 SSH 隧道访问
+    volumes:
+      - ./config.yaml:/app/configs/config.yaml:ro
+      - ./keys:/app/keys:ro
+    logging: *logging
+
+volumes:
+  mysql-data:

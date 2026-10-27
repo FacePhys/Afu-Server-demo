@@ -18,5 +18,6 @@ var (
 	ErrUnknownKid         = &Error{http.StatusBadRequest, "unknown_kid", "unknown kid"}
 	ErrDecryptFailed      = &Error{http.StatusBadRequest, "decrypt_failed", "decrypt failed"} // rsa、gcm失败都用它，msg固定
 	ErrBadPayload         = &Error{http.StatusBadRequest, "bad_payload", "bad payload"}
+	ErrInvalidAppKey      = &Error{http.StatusForbidden, "invalid_app_key", "invalid app key"} // app_key 不存在或已停用
 	ErrInternal           = &Error{http.StatusInternalServerError, "internal_error", "internal error"}
 )

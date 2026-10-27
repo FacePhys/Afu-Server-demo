@@ -1,18 +1,18 @@
 # 内部数据后台设计
 
-> 仅供内部使用，不对客户、阿福公开，不写进 `readme.md`。只读：查看安装、上传记录和用量统计，不提供任何修改数据的接口。
+> 仅供内部使用，不对客户、阿福公开，不写进 `readme.md`。查看安装、上传记录和用量统计；唯一的写操作是 App Key 管理(生成或导入、停用 / 启用)。后台不按 app_key 区分统计。
 
 ## 总体方案
 
-| 项目     | 方案                                                                      | 说明                                                              |
-| -------- | ------------------------------------------------------------------------- | ----------------------------------------------------------------- |
-| 部署     | 和主服务同一个进程，单独监听一个端口                                      | 公网端口只有 `POST /afu/v1/meter`，内部接口从公网端口根本访问不到 |
-| 监听地址 | 配置项 `admin.addr`，示例配置里留空(不启动)；本地开发填 `127.0.0.1:18081` | 生产只绑内网地址并配防火墙                                        |
-| 接口     | `GET /afu/internal/api/v1/...`，明文json                                  | 全部是GET，不加密报文                                             |
-| 鉴权     | 固定Token：`Authorization: Bearer <token>`                                | 配置里只存Token的SHA-256，按人分配，审计日志记录是谁              |
-| 数据库   | 配置项 `admin.db_dsn`，建议用只读账号                                     | 留空时复用 `db.dsn`；只读账号保证后台有bug也写不了库              |
-| 前端     | React 19 + Ant Design 6 + Vite + TypeScript                               | 构建产物用 `go:embed` 打进二进制，由后台端口直接提供              |
-| 时区     | 库里存UTC；接口返回RFC3339(UTC)；页面按北京时间显示                       | 按天统计按北京时间(UTC+8)分天                                     |
+| 项目     | 方案                                                                      | 说明                                                                                       |
+| -------- | ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------ |
+| 部署     | 和主服务同一个进程，单独监听一个端口                                      | 公网端口只有 `POST /afu/v1/meter`，内部接口从公网端口根本访问不到                          |
+| 监听地址 | 配置项 `admin.addr`，示例配置里留空(不启动)；本地开发填 `127.0.0.1:18081` | 生产只绑内网地址并配防火墙                                                                 |
+| 接口     | `/afu/internal/api/v1/...`，明文json                                      | 查询都是GET；App Key 管理用 POST / PATCH                                                   |
+| 鉴权     | 固定Token：`Authorization: Bearer <token>`                                | 配置里只存Token的SHA-256，按人分配，审计日志记录是谁                                       |
+| 数据库   | 配置项 `admin.db_dsn`，建议单独账号                                       | 留空时复用 `db.dsn`；单独账号只给三张数据表 SELECT、`app_keys` 表 SELECT / INSERT / UPDATE |
+| 前端     | React 19 + Ant Design 6 + Vite + TypeScript                               | 构建产物用 `go:embed` 打进二进制，由后台端口直接提供                                       |
+| 时区     | 库里存UTC；接口返回RFC3339(UTC)；页面按北京时间显示                       | 按天统计按北京时间(UTC+8)分天                                                              |
 
 ## 配置
 
@@ -31,18 +31,19 @@ admin:
 2. 比较时先算请求Token的SHA-256，再用 `subtle.ConstantTimeCompare` 和配置逐个比较。
 3. 停用某人：删掉配置里那一项并重启。
 
-只读账号示例(生产库)：
+后台单独账号示例(生产库)：
 
 ```sql
 CREATE USER 'afu_console'@'10.%' IDENTIFIED BY '<密码>';
 GRANT SELECT ON afu.installs TO 'afu_console'@'10.%';
 GRANT SELECT ON afu.reports TO 'afu_console'@'10.%';
 GRANT SELECT ON afu.measurements TO 'afu_console'@'10.%';
+GRANT SELECT, INSERT, UPDATE ON afu.app_keys TO 'afu_console'@'10.%';
 ```
 
 ## 接口约定
 
-1. 前缀 `/afu/internal/api/v1`(所有接口统一带 `/afu`)，只有GET；前端页面仍在根路径。
+1. 前缀 `/afu/internal/api/v1`(所有接口统一带 `/afu`)；查询用GET，App Key 管理用 POST / PATCH(json请求体，上限4KB)；前端页面仍在根路径。
 2. 每个请求都要带 `Authorization: Bearer <token>`，否则返回401。
 3. 成功返回http 200 + 数据对象本身；失败返回对应状态码 + `{"code": "...", "msg": "..."}`，和主接口的错误格式一致。
 4. 时间参数 `from`、`to` 用RFC3339，例如 `2026-10-26T00:00:00+08:00`，区间左闭右开。按天统计的区间最长92天。
@@ -57,6 +58,7 @@ GRANT SELECT ON afu.measurements TO 'afu_console'@'10.%';
 | 400        | bad_request    | 参数格式错误、时间区间超过92天、limit超过100 |
 | 401        | unauthorized   | 没带Token或Token不对                         |
 | 404        | not_found      | 安装记录、上报记录不存在                     |
+| 409        | app_key_exists | 导入的 App Key 已经存在                      |
 | 500        | internal_error | 内部错误，详细原因只写日志                   |
 
 ## 接口列表
@@ -66,12 +68,14 @@ GRANT SELECT ON afu.measurements TO 'afu_console'@'10.%';
 | `GET /me`                    | 校验Token，返回当前用户名                                  |
 | `GET /meta`                  | 服务配置(单次测量额度、ttl_sec、report_sec、可用kid)和版本 |
 | `GET /overview`              | 概览：时间区间内的关键数字                                 |
-| `GET /stats/daily`           | 按天统计，可按app_key过滤                                  |
-| `GET /stats/app-keys`        | 按app_key统计                                              |
+| `GET /stats/daily`           | 按天统计                                                   |
 | `GET /installs`              | 安装记录列表                                               |
 | `GET /installs/{install_id}` | 安装记录详情                                               |
 | `GET /reports`               | 上传记录列表：每行一次上报，带解析后的本次测量和累计计数   |
 | `GET /reports/{id}`          | 单次上传详情，含解密后的原始明文                           |
+| `GET /app-keys`              | App Key 列表(新的在前)                                     |
+| `POST /app-keys`             | 生成 App Key；传 `app_key` 时按原值导入                    |
+| `PATCH /app-keys/{id}`       | 停用 / 启用、改备注                                        |
 
 ### GET /me
 
@@ -119,7 +123,7 @@ GRANT SELECT ON afu.measurements TO 'afu_console'@'10.%';
 
 ### GET /stats/daily
 
-参数：`from`、`to`(默认近30天)、`app_key`(可选)。
+参数：`from`、`to`(默认近30天)。
 
 ```json
 {
@@ -133,36 +137,15 @@ GRANT SELECT ON afu.measurements TO 'afu_console'@'10.%';
 2. 没有数据的日期也返回一行，数值为0，方便画连续的折线。
 3. 测量按服务端入库时间统计，不用客户端的start_ts，客户端时间可能不准。
 
-### GET /stats/app-keys
-
-参数：`from`、`to`(默认近30天)。
-
-```json
-{
-  "items": [
-    {"app_key": "AK-demo", "installs": 120, "active_installs": 30, "measurements": 300,
-     "frames": 90000, "dt_ms": 2989800, "last_report_at": "2026-10-26T04:14:52.963Z"}
-  ]
-}
-```
-
-| 字段                        | 统计方式                |
-| --------------------------- | ----------------------- |
-| installs                    | 该app_key的全部安装记录 |
-| active_installs             | 区间内有上报的安装数    |
-| measurements、frames、dt_ms | 区间内的测量            |
-| last_report_at              | 最近一次上报时间        |
-
 ### GET /installs
 
-参数：`install_id`(精确匹配)、`app_key`、`platform`、`reset_reason`、`from`、`to`(按创建时间)、`cursor`、`limit`。`reset_reason` 传 `first` 表示首次安装(库里为空字符串)。
+参数：`install_id`(精确匹配)、`platform`、`reset_reason`、`from`、`to`(按创建时间)、`cursor`、`limit`。`reset_reason` 传 `first` 表示首次安装(库里为空字符串)。
 
 ```json
 {
   "items": [
     {
       "install_id": "2638d8400d60c9fedfb1e8bdf92af87a",
-      "app_key": "AK-demo",
       "app_id": "com.example.app",
       "platform": "android",
       "sdk": "1.1.0-beta.1",
@@ -183,7 +166,7 @@ GRANT SELECT ON afu.measurements TO 'afu_console'@'10.%';
 
 ### GET /reports
 
-参数：`install_id`、`app_key`、`from`、`to`(按received_at)、`max_dt_ms`(只看带有时长不超过该值的测量的上报，传5000即含短测量)、`cursor`、`limit`。reports表没有app_key，按app_key筛选时关联installs表；`max_dt_ms` 按 install_id + seq 关联measurements表。列表直接带上报内容：从明文解析出的 `counters`(累计值)和 `measurements`(本次上报带的测量，空上报为 `[]`)；不带原始明文，原文看详情接口。
+参数：`install_id`、`from`、`to`(按received_at)、`max_dt_ms`(只看带有时长不超过该值的测量的上报，传5000即含短测量)、`cursor`、`limit`。`max_dt_ms` 按 install_id + seq 关联measurements表。列表直接带上报内容：从明文解析出的 `counters`(累计值)和 `measurements`(本次上报带的测量，空上报为 `[]`)；不带原始明文，原文看详情接口。
 
 ```json
 {
@@ -212,6 +195,34 @@ GRANT SELECT ON afu.measurements TO 'afu_console'@'10.%';
 }
 ```
 
+### App Key 管理
+
+`POST /app-keys` 请求体：
+
+```json
+{"remark": "阿福正式环境", "app_key": ""}
+```
+
+1. `app_key` 留空：生成 `AK-` 加32位小写hex。
+2. `app_key` 有值：按原值导入，用于已经发给客户的 App Key；只能包含字母、数字、`-`、`_`，最多64个字符；已存在返回409。
+3. 返回201和新记录；`created_by` 记录后台Token的name。
+
+`PATCH /app-keys/{id}` 请求体，两个字段至少一个：
+
+```json
+{"status": "disabled", "remark": "已停用"}
+```
+
+1. 不提供删除，停用即可；停用后带这个 App Key 的注册、上报返回403。
+2. 生成、修改都会写一条操作日志(操作人、App Key、状态)，另外照常有审计日志。
+
+返回结构：
+
+```json
+{"id": 1, "app_key": "AK-f24277919892cdc6a5670c27d6fe1212", "remark": "阿福正式环境", "status": "enabled",
+ "created_by": "liujiaxuan", "created_at": "2026-10-26T11:17:17.222Z", "updated_at": "2026-10-26T11:17:17.222Z"}
+```
+
 ## 索引
 
 上线前直接加进 `migrations/001_init.sql`；上线后改表一律新增迁移文件。
@@ -225,9 +236,8 @@ KEY idx_received_at (received_at)
 KEY idx_created_at (created_at)
 ```
 
-1. 按app_key筛安装用已有的 `idx_app_key`；二级索引里带主键，按id倒序翻页不用额外排序。
-2. 按install_id查上报、测量用已有的唯一索引。
-3. 数据量上来后，按app_key统计、筛选需要关联installs表，会变慢。届时在reports、measurements里冗余app_key列，或者按天预先汇总。
+1. 按install_id查安装、上报、测量用已有的唯一索引；按id倒序翻页走主键。
+2. 数据量上来后，按天统计可以改成预先汇总。
 
 ## 后端实现
 
@@ -235,7 +245,8 @@ KEY idx_created_at (created_at)
 internal/console/
 ├── server.go     # 后台Gin引擎：中间件(审计、recovery、安全响应头)、路由、静态文件
 ├── auth.go       # Token校验
-├── handlers.go   # 各接口及只读查询
+├── handlers.go   # 各查询接口
+├── appkeys.go    # App Key 管理(生成或导入、停用 / 启用)
 ├── params.go     # 参数解析(时间区间、游标、limit)
 └── types.go      # 响应结构体
 web/
@@ -283,7 +294,8 @@ web/
     │   ├── Usage.tsx
     │   ├── Installs.tsx
     │   ├── InstallDetail.tsx
-    │   └── Uploads.tsx       # 上传记录列表页
+    │   ├── Uploads.tsx       # 上传记录列表页
+    │   └── AppKeys.tsx       # App Key 管理
     ├── components/
     │   ├── CursorTable.tsx   # 游标分页表格：上一页 / 下一页
     │   ├── TimeRange.tsx     # 今天 / 近7天 / 近30天 / 自定义
@@ -298,16 +310,17 @@ web/
 
 ### 页面
 
-| 路由                   | 页面     | 内容                                                                                                                                                      |
-| ---------------------- | -------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `/login`               | 登录     | 输入Token，调 `/me` 校验通过后存入sessionStorage(关闭标签页即失效)                                                                                        |
-| `/`                    | 概览     | 时间区间选择；关键数字卡片；按天的测量次数和时长柱状图；平台分布                                                                                          |
-| `/usage`               | 用量统计 | 按app_key的表格；点某个app_key展开它的按天柱状图                                                                                                          |
-| `/installs`            | 安装     | 筛选(install_id、app_key、平台、新安装原因、创建时间) + 表格；每行有「查看上传记录」按钮(点整行也可以)，进入安装详情                                      |
-| `/installs/:installId` | 安装详情 | 左上角「返回」(回到进来前的页面，直接打开链接时回到安装列表)；基本信息、已确认seq和counters；「上传记录」列出该编号全部已入库的上报，内容同上传记录页     |
-| `/uploads`             | 上传记录 | 筛选(install_id、app_key、收到时间、只看含5秒及以内测量的) + 表格：每行一次上传，直接显示本次测量和累计计数，空上报单独标出；点「查看明文」在抽屉里看原文 |
+| 路由                   | 页面     | 内容                                                                                                                                                  |
+| ---------------------- | -------- | ----------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/login`               | 登录     | 输入Token，调 `/me` 校验通过后存入sessionStorage(关闭标签页即失效)                                                                                    |
+| `/`                    | 概览     | 时间区间选择；关键数字卡片；按天的测量次数和时长柱状图；平台分布                                                                                      |
+| `/usage`               | 用量统计 | 时间区间选择；按天柱状图；按天表格(新的日期在前)，表尾是区间合计                                                                                      |
+| `/installs`            | 安装     | 筛选(install_id、平台、新安装原因、创建时间) + 表格；每行有「查看上传记录」按钮(点整行也可以)，进入安装详情                                           |
+| `/installs/:installId` | 安装详情 | 左上角「返回」(回到进来前的页面，直接打开链接时回到安装列表)；基本信息、已确认seq和counters；「上传记录」列出该编号全部已入库的上报，内容同上传记录页 |
+| `/uploads`             | 上传记录 | 筛选(install_id、收到时间、只看含5秒及以内测量的) + 表格：每行一次上传，直接显示本次测量和累计计数，空上报单独标出；点「查看明文」在抽屉里看原文      |
+| `/app-keys`            | App Key  | 列表；「生成 App Key」弹窗(备注、可选的导入值)；停用需二次确认，已停用的可重新启用                                                                    |
 
-左侧菜单：概览、用量统计、安装、上传记录；顶部右侧显示服务版本、当前用户名和「退出」。
+左侧菜单：概览、用量统计、安装、上传记录、App Key；顶部右侧显示服务版本、当前用户名和「退出」。
 
 按天的图用柱状图：只有一天的数据时折线画不出来；日期只显示「月-日」，放不下时自动隐藏。
 
@@ -333,7 +346,7 @@ web/
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │ 2638d8400d60c9fedfb1e8bdf92af87a [复制]                              │
-│ app_key AK-demo    app_id com.example.app    平台 android            │
+│ app_id com.example.app    平台 android                               │
 │ sdk 1.1.0-beta.1   新安装原因 首次   创建 2026-10-26 12:14:52        │
 ├──────────────────────────────────────────────────────────────────────┤
 │ 已确认 seq 1   测量次数 1   有效帧数 300   时长 9.97秒   run 10      │
@@ -368,19 +381,20 @@ web/
 ## 测试
 
 1. 后端单元测试：鉴权(无Token、错误Token、正确Token)、参数解析(时间格式、区间上限、limit上限、游标)。
-2. 后端集成测试(`AFU_TEST_DSN`，和主流程的集成测试共用测试库，`make itest` 用 `-p 1` 串行跑)：造几条安装、上报、测量，校验每个接口的统计数字、过滤条件、翻页不重不漏、按北京时间分天。
+2. 后端集成测试(`AFU_TEST_DSN`，和主流程的集成测试共用测试库，`make itest` 用 `-p 1` 串行跑)：造几条安装、上报、测量，校验每个接口的统计数字、过滤条件、翻页不重不漏、按北京时间分天；App Key 的生成、导入、重复导入、停用。
 3. 前端：`tsc --noEmit` 类型检查和构建必须通过；`utils/` 里的时间、时长格式化写单元测试(Vitest)。
 
 ## 开发顺序
 
-| 阶段 | 内容                                            | 验收                                           |
-| ---- | ----------------------------------------------- | ---------------------------------------------- |
-| 1    | 配置、Token鉴权、审计日志、后台监听、索引       | 无Token返回401，正确Token访问 `/me` 返回用户名 |
-| 2    | 查询接口：installs、reports、measurements       | 集成测试覆盖过滤和翻页                         |
-| 3    | 统计接口：overview、stats/daily、stats/app-keys | 集成测试校验统计数字和分天                     |
-| 4    | 前端：登录、布局、安装 / 上传记录页面           | 本地 `make web-dev` 能查到fakeclient造的数据   |
-| 5    | 前端：概览、用量统计图表                        | 同上                                           |
-| 6    | 前端打进二进制，`make build` 一个产物           | 只启动server就能打开后台                       |
+| 阶段 | 内容                                      | 验收                                                         |
+| ---- | ----------------------------------------- | ------------------------------------------------------------ |
+| 1    | 配置、Token鉴权、审计日志、后台监听、索引 | 无Token返回401，正确Token访问 `/me` 返回用户名               |
+| 2    | 查询接口：installs、reports、measurements | 集成测试覆盖过滤和翻页                                       |
+| 3    | 统计接口：overview、stats/daily           | 集成测试校验统计数字和分天                                   |
+| 4    | 前端：登录、布局、安装 / 上传记录页面     | 本地 `make web-dev` 能查到fakeclient造的数据                 |
+| 5    | 前端：概览、用量统计图表                  | 同上                                                         |
+| 6    | 前端打进二进制，`make build` 一个产物     | 只启动server就能打开后台                                     |
+| 7    | App Key 管理：接口 + 页面                 | 集成测试覆盖生成、导入、重复导入409、停用；停用后注册返回403 |
 
 ## 后续(本期不做)
 
