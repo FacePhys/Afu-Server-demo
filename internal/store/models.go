@@ -69,6 +69,10 @@ type Report struct {
 	ClientTS   int64     `gorm:"column:client_ts"`
 	Payload    string    `gorm:"column:payload"` // JSON列用string，[]byte会按binary发送导致报错3144
 	ReceivedAt time.Time `gorm:"column:received_at;autoCreateTime"`
+	// 相对上一次已确认值的增量，后台按天统计用；换号那份上报是基线，为0
+	DeltaSessions uint64 `gorm:"column:delta_sessions"`
+	DeltaFrames   uint64 `gorm:"column:delta_frames"`
+	DeltaDtMs     uint64 `gorm:"column:delta_dt_ms"`
 }
 
 func (Report) TableName() string { return "reports" }
@@ -105,8 +109,11 @@ const (
 // 金额一律用整数，单位 0.0001 元。
 const MoneyUnitsPerYuan = 10000
 
+// DefaultOfflineRuns 新建 App Key 时离线可用次数的默认值，与 004_offline_runs.sql 的列默认值一致。
+const DefaultOfflineRuns = 5
+
 // AppKey 由内部后台生成或导入，注册、上报带的 app_key 必须存在且已启用。
-// 按次计费：每次上报按「新增测量次数 × 单价」从余额扣，余额加透支额度不够付下一次时停发额度。
+// 按次计费：每次上报按「新增计次 × 单价」从余额扣，余额加透支额度不够付下一次时停发额度。
 type AppKey struct {
 	ID             uint64    `gorm:"column:id;primaryKey"`
 	AppKey         string    `gorm:"column:app_key"`
@@ -115,7 +122,8 @@ type AppKey struct {
 	UnitPrice      uint64    `gorm:"column:unit_price"`      // 单价，0.0001元/次；0为不收费
 	Balance        int64     `gorm:"column:balance"`         // 余额，0.0001元；透支时为负
 	OverdraftLimit uint64    `gorm:"column:overdraft_limit"` // 透支额度，0.0001元
-	UsedCount      uint64    `gorm:"column:used_count"`      // 累计计费测量次数
+	UsedCount      uint64    `gorm:"column:used_count"`      // 累计计费的计次
+	OfflineRuns    uint64    `gorm:"column:offline_runs"`    // 离线可用次数：从已确认往后还能新增几次计次，cap_runs 直接下发
 	CreatedBy      string    `gorm:"column:created_by"`
 	CreatedAt      time.Time `gorm:"column:created_at"`
 	UpdatedAt      time.Time `gorm:"column:updated_at"`

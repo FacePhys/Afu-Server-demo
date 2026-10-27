@@ -31,7 +31,7 @@ func newTestServer(t *testing.T, static fs.FS) *Server {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	cfg := config.AdminConfig{Tokens: []config.AdminToken{tokenCfg("alice", testToken), tokenCfg("bob", "other")}}
-	meter := config.MeterConfig{PerMeasureFrames: 300, PerMeasureRuns: 10, TTLSec: 86400, ReportSec: 60}
+	meter := config.MeterConfig{TTLSec: 86400, ReportSec: 60}
 	s, err := New(nil, cfg, meter, []int{3, 1}, static, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
@@ -78,7 +78,7 @@ func TestMeta(t *testing.T) {
 	w := get(t, newTestServer(t, fstest.MapFS{}).Router(), "/afu/internal/api/v1/meta", testToken)
 	var m Meta
 	json.Unmarshal(w.Body.Bytes(), &m)
-	if m.PerMeasureFrames != 300 || m.ReportSec != 60 || len(m.ActiveKids) != 2 || m.ActiveKids[0] != 1 || m.Version == "" {
+	if m.TTLSec != 86400 || m.ReportSec != 60 || len(m.ActiveKids) != 2 || m.ActiveKids[0] != 1 || m.Version == "" {
 		t.Fatalf("meta = %+v", m)
 	}
 }
@@ -201,6 +201,8 @@ func TestAppKeyValidation(t *testing.T) {
 		{http.MethodPost, base, `{"unit_price":-1}`, 400},
 		{http.MethodPost, base, `{"unit_price":1000000001}`, 400}, // 超过10万元/次
 		{http.MethodPatch, base + "/1", `{"overdraft_limit":-5}`, 400},
+		{http.MethodPost, base, `{"offline_runs":-1}`, 400},
+		{http.MethodPatch, base + "/1", `{"offline_runs":17}`, 400}, // 上限16：一份上报最多16条measurements
 		{http.MethodPost, base + "/1/recharge", `{"amount":0}`, 400},
 		{http.MethodPost, base + "/1/recharge", `{"amount":-100}`, 400},
 		{http.MethodPost, base + "/abc/recharge", `{"amount":100}`, 404},

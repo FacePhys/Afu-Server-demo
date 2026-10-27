@@ -28,12 +28,12 @@
 │   ├── envelope/             # ct的解密、加密(rsa-oaep + aes-gcm + aad)
 │   ├── protocol/             # 报文结构体、字段校验、错误码、类型常量
 │   ├── handler/              # Gin路由、「通用处理」10步
-│   ├── service/              # 注册处理、上报处理、换号、cap计算、install_id生成
-│   ├── billing/              # 计费接口：KeyBilling 按次计费(单价 × 新增测量次数，从余额扣)，其余规则留桩
+│   ├── service/              # 注册处理、上报处理、换号、回复字段计算、install_id生成
+│   ├── billing/              # 计费接口：KeyBilling 按次计费(单价 × 新增计次，从余额扣)，其余规则留桩
 │   ├── store/                # MySQL读写
 │   └── console/              # 内部数据后台的只读接口，见 docs/internal-console.md
 ├── web/                      # 内部数据后台前端(React + Ant Design)，构建产物打进二进制
-├── migrations/               # 建表：001_init.sql、002_app_keys.sql，按文件名顺序执行
+├── migrations/               # 建表、改表：001_init.sql ~ 005_report_deltas.sql，按文件名顺序执行
 ├── configs/config.example.yaml
 ├── keys/                     # 本地私钥，不提交
 ├── docker-compose.yml        # 本地MySQL
@@ -66,11 +66,9 @@ keys:                           # 只加载 status = active 的密钥，其余ki
     private_key_file: "keys/kid1.pem"
     status: active
 
-meter:
-  per_measure_frames: 300       # 单次测量额度(帧)，等算法给值
-  per_measure_runs: 10          # 单次测量额度(run)
-  ttl_sec: 86400                # 原样下发
-  report_sec: 60                # 原样下发
+meter:                          # cap_runs 取 App Key 的离线可用次数(内部后台配置)，cap_frames 固定为0，都不在配置里
+  ttl_sec: 0                    # 原样下发；0 = 额度不限时
+  report_sec: 60                # 原样下发，SDK 不用
 
 log:
   level: info
@@ -130,11 +128,11 @@ CREATE TABLE IF NOT EXISTS measurements (
 ```
 
 1. 列名避开MySQL关键字：`reset` → `reset_reason`，`no` → `measure_no`。
-2. App Key 表在 `migrations/002_app_keys.sql`(app_key 列用 utf8mb4_bin，区分大小写)，由内部后台生成或导入；`003_billing.sql` 加了单价 `unit_price`、余额 `balance`、透支额度 `overdraft_limit`、累计计费次数 `used_count` 和计费流水表 `billing_ledger`；金额一律用整数，单位 0.0001 元。
-3. 客户、额度、扣费流水的表等计费细则同步后再设计，现在不建。
-3. 写measurements要忽略重复的no：`Clauses(clause.OnConflict{DoNothing: true})`，在MySQL下生成 `ON DUPLICATE KEY UPDATE id=id`。不要用 `INSERT IGNORE`，它会把截断等其他错误也吞掉。
-4. 唯一键冲突判断：开启 `TranslateError` 后用 `errors.Is(err, gorm.ErrDuplicatedKey)`，驱动会把MySQL错误码1062转换成它。
-5. `reports.payload` 在Go模型里用 `string`，不要用 `[]byte`：驱动按binary字符集发送 `[]byte`，写JSON列会报错3144。
+2. App Key 表在 `migrations/002_app_keys.sql`(app_key 列用 utf8mb4_bin，区分大小写)，由内部后台生成或导入；`003_billing.sql` 加了单价 `unit_price`、余额 `balance`、透支额度 `overdraft_limit`、累计计费次数 `used_count` 和计费流水表 `billing_ledger`；金额一律用整数，单位 0.0001 元；`004_offline_runs.sql` 加了离线可用次数 `offline_runs`(默认5，后台限制0~16)；`005_report_deltas.sql` 给 `reports` 加了本次增量 `delta_sessions`、`delta_frames`、`delta_dt_ms`(后台按天统计用)，并按 measurements 补算了升级前的上报。
+3. 客户的表等计费细则同步后再设计，现在不建。
+4. 写measurements要忽略重复的no：`Clauses(clause.OnConflict{DoNothing: true})`，在MySQL下生成 `ON DUPLICATE KEY UPDATE id=id`。不要用 `INSERT IGNORE`，它会把截断等其他错误也吞掉。
+5. 唯一键冲突判断：开启 `TranslateError` 后用 `errors.Is(err, gorm.ErrDuplicatedKey)`，驱动会把MySQL错误码1062转换成它。
+6. `reports.payload` 在Go模型里用 `string`，不要用 `[]byte`：驱动按binary字符集发送 `[]byte`，写JSON列会报错3144。
 
 ## GORM使用约定
 
@@ -286,12 +284,13 @@ type ReportReq struct {
 }
 
 type Ack struct {
-	InstallID string `json:"install_id"`
-	Seq       uint64 `json:"seq"`
-	CapFrames uint64 `json:"cap_frames"`
-	CapRuns   uint64 `json:"cap_runs"`
-	TTLSec    int    `json:"ttl_sec"`
-	ReportSec int    `json:"report_sec"`
+	InstallID     string `json:"install_id"`
+	Seq           uint64 `json:"seq"`
+	AckedSessions uint64 `json:"acked_sessions"` // 必填，0也要带
+	CapFrames     uint64 `json:"cap_frames"`
+	CapRuns       uint64 `json:"cap_runs"`
+	TTLSec        int    `json:"ttl_sec"`
+	ReportSec     int    `json:"report_sec"`
 }
 
 // refused = ack全部字段 + reason
@@ -497,7 +496,8 @@ func (h *Handler) Meter(c *gin.Context) {
 
 ```go
 func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (string, any, error) {
-	if err := s.checkAppKey(ctx, req.InstallID, req.AppKey); err != nil { // 不存在或已停用：403，不入库
+	key, err := s.loadAppKey(ctx, req.InstallID, req.AppKey) // 不存在或已停用：403，不入库；顺带取离线可用次数
+	if err != nil {
 		return "", nil, err
 	}
 	if err := s.billing.ValidateApp(ctx, req.AppKey, req.AppID); err != nil { // 留桩：放行
@@ -513,7 +513,7 @@ func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (strin
 	db := s.db.WithContext(ctx)
 	err = db.Create(&inst).Error
 	if err == nil {
-		return protocol.TypeAck, s.ack(inst.InstallID, 0, protocol.Counters{}, hasQuota), nil
+		return protocol.TypeAck, s.ack(inst.InstallID, 0, 0, key, hasQuota), nil // acked_sessions = 0
 	}
 	if !errors.Is(err, gorm.ErrDuplicatedKey) {
 		return "", nil, err
@@ -525,10 +525,7 @@ func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (strin
 	if err := s.createWithNewID(db, &newInst); err != nil { // 生成新编号插入，撞上唯一键就重新生成
 		return "", nil, err
 	}
-	return protocol.TypeRefused, protocol.Refused{
-		Ack:    s.ack(newInst.InstallID, 0, protocol.Counters{}, hasQuota),
-		Reason: protocol.ReasonConflict,
-	}, nil
+	return protocol.TypeRefused, s.refused(newInst.InstallID, 0, 0, key, hasQuota, protocol.ReasonConflict), nil
 }
 ```
 
@@ -541,7 +538,7 @@ type reportResult struct {
 	respType  string
 	installID string
 	seq       uint64
-	counters  protocol.Counters
+	acked     uint64 // 已确认的累计计次，回复的 acked_sessions
 	appKey    string
 	needQuota bool // 重复上报、换号：事务提交后再查额度
 	charge    billing.ChargeResult
@@ -549,8 +546,12 @@ type reportResult struct {
 }
 
 func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte) (string, any, error) {
+	key, err := s.loadAppKey(ctx, req.InstallID, req.AppKey) // 同注册
+	if err != nil {
+		return "", nil, err
+	}
 	var res reportResult
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var inst store.Install
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("install_id = ?", req.InstallID).Take(&inst).Error
@@ -560,29 +561,26 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 		if err != nil {
 			return err
 		}
-		res.respType, res.installID, res.appKey = protocol.TypeAck, inst.InstallID, inst.AppKey
+		res.respType, res.installID, res.appKey = protocol.TypeAck, inst.InstallID, req.AppKey // 按这次请求带的 App Key 计次
 
 		// 重复上报：不入库、不扣费，按当前状态回ack
 		if req.Seq <= inst.ConfirmedSeq {
-			res.seq, res.counters, res.needQuota = inst.ConfirmedSeq, inst.Counters(), true
+			res.seq, res.acked, res.needQuota = inst.ConfirmedSeq, inst.CSessions, true
 			return nil
-		}
-
-		if err := tx.Create(&store.Report{InstallID: inst.InstallID, Seq: req.Seq,
-			ClientTS: req.TS, Payload: string(raw)}).Error; err != nil {
-			return err
-		}
-		if ms := store.ToMeasurements(inst.InstallID, req.Seq, req.Measurements); len(ms) > 0 {
-			if err := tx.Clauses(clause.OnConflict{DoNothing: true}).Create(&ms).Error; err != nil {
-				return err
-			}
 		}
 
 		delta, regressed := protocol.Delta(inst.Counters(), req.Counters) // 每项 max(0, 新 - 旧)
 		if regressed {
 			s.log.Warn("counters regressed", "install_id", inst.InstallID, "seq", req.Seq)
 		}
-		charge, err := s.billing.Charge(ctx, tx, billing.ChargeRequest{ // 按新增测量次数扣费、判断额度
+		if delta.Sessions > key.OfflineRuns { // SDK 最多先用 cap_runs 次，超了说明 SDK 被改过或有 bug
+			s.log.Warn("sessions delta exceeds cap_runs", "install_id", inst.InstallID, "seq", req.Seq)
+		}
+		// 保存明文和本次增量(后台按天统计用)；measurements 重复的no忽略
+		if err := saveReport(tx, inst.InstallID, req, raw, delta); err != nil {
+			return err
+		}
+		charge, err := s.billing.Charge(ctx, tx, billing.ChargeRequest{ // 按新增计次扣费、判断额度
 			AppKey: req.AppKey, InstallID: inst.InstallID, Seq: req.Seq, Delta: delta})
 		if err != nil {
 			return err
@@ -593,7 +591,7 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 			Updates(store.ConfirmedUpdates(req.Seq, confirmed)).Error; err != nil { // map，零值也会写入
 			return err
 		}
-		res.seq, res.counters, res.charge = req.Seq, confirmed, charge
+		res.seq, res.acked, res.charge = req.Seq, confirmed.Sessions, charge
 		return nil
 	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -610,11 +608,10 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 		go s.notifier.QuotaWarning(context.WithoutCancel(ctx), res.appKey)
 	}
 
-	ack := s.ack(res.installID, res.seq, res.counters, hasQuota)
 	if res.respType == protocol.TypeRefused {
-		return protocol.TypeRefused, protocol.Refused{Ack: ack, Reason: res.reason}, nil
+		return protocol.TypeRefused, s.refused(res.installID, res.seq, res.acked, key, hasQuota, res.reason), nil
 	}
-	return protocol.TypeAck, ack, nil
+	return protocol.TypeAck, s.ack(res.installID, res.seq, res.acked, key, hasQuota), nil
 }
 ```
 
@@ -622,23 +619,28 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 
 1. 校验app_key、app_id(留桩放行)。
 2. 生成新install_id，插入安装记录：`reset_reason = unregistered`，`confirmed_seq = req.Seq`，已确认counters = `req.Counters`(作为基线)。
-3. 以新编号保存本次上报和measurements。
+3. 以新编号保存本次上报和measurements，本次增量记为0(基线)。
 4. 触发换号的这次测量是否计费：调用 `billing.OnReassign` 留桩，默认不扣。
-5. 设置 `res.appKey = req.AppKey`、`res.needQuota = true`；事务提交后查额度，返回 `refused(unregistered)`：install_id为新编号，seq为 `req.Seq`，cap按基线计算。
+5. 设置 `res.appKey = req.AppKey`、`res.acked = req.Counters.Sessions`、`res.needQuota = true`；事务提交后查额度，返回 `refused(unregistered)`：install_id为新编号，seq为 `req.Seq`，其余按「回复字段计算」组装。
 
-### cap计算
+### 回复字段计算
+
+注册、上报开头的 `loadAppKey` 校验 app_key 时顺带取出这个 App Key 的 `offline_runs`；事务提交后再查额度，组装回复：
 
 ```go
-func (s *Service) ack(installID string, seq uint64, c protocol.Counters, hasQuota bool) protocol.Ack {
-	a := protocol.Ack{InstallID: installID, Seq: seq, CapFrames: c.FramesOK, CapRuns: c.RunOK,
-		TTLSec: s.cfg.TTLSec, ReportSec: s.cfg.ReportSec}
+// acked 是已确认的累计计次；cap_runs 取 App Key 的离线可用次数，余额加透支额度不够付下一次时为0；cap_frames 固定为0。
+func (s *Service) ack(installID string, seq, acked uint64, key store.AppKey, hasQuota bool) protocol.Ack {
+	a := protocol.Ack{InstallID: installID, Seq: seq, AckedSessions: acked, TTLSec: s.cfg.TTLSec, ReportSec: s.cfg.ReportSec}
 	if hasQuota {
-		a.CapFrames += s.cfg.PerMeasureFrames
-		a.CapRuns += s.cfg.PerMeasureRuns
+		a.CapRuns = key.OfflineRuns
 	}
 	return a
 }
 ```
+
+1. acked：注册为0；正常上报为取大后的 `c_sessions`；重复上报为库里的 `c_sessions`；上报换号为 `req.Counters.Sessions`(基线)。
+2. 后台改了离线可用次数，从下一次回复开始生效；重复上报、换号的回复也按当前值下发。
+3. 离线可用次数上限是 `protocol.MaxMeasurements`(16)：SDK 每份上报带全部没确认的计次，cap_runs 再大一份就装不下，会一直400。
 
 ## 计费(internal/billing)
 
@@ -666,10 +668,10 @@ type Notifier interface {
 
 1. 金额一律用整数，单位 0.0001 元(`store.MoneyUnitsPerYuan` = 10000)，避免小数误差。
 2. 扣费：`Charge` 在上报事务里先 `FOR UPDATE` 锁住这个 App Key 的行，余额减去 `delta.Sessions × unit_price`，`used_count += delta.Sessions`，再记一条扣费流水(install_id、seq、次数、单价、扣后余额)。同一个 App Key 的扣费串行，加锁顺序固定为「安装记录 → App Key」，不会死锁。
-3. 额度：单价为0不收费(照常计次、记流水)；`balance + overdraft_limit ≥ unit_price` 时还发额度，否则停发(ack 的 cap 等于已确认值)。按发出去的额度扣，不会扣穿透支额度。
+3. 额度：单价为0不收费(照常计次、记流水)；`balance + overdraft_limit ≥ unit_price` 时还发额度，否则停发(ack / refused 的 cap_runs 为0)。
 4. 计费状态：`free` 不收费、`normal` 余额不为负、`overdraft` 余额为负但还够付一次、`exhausted` 停发。进入 `overdraft` 或 `exhausted` 时 `ChargeResult.Warn` 为 true，`LogNotifier` 记一条 `quota warning` 日志。
 5. 重复上报、空上报、计数变小时增量为0，不扣费；上报换号时以本次计数为基线，触发换号的这次测量不扣费。
-6. 允许少量超出：额度是在发 ack 时判断的，停发之前已经拿到额度的设备还能各测一次，所以余额最多超出透支额度「当时手里还有额度的设备数 × 单价」。
+6. 允许超出：额度是在发回复时判断的，停发之前已经放出去的次数不会收回，设备照常用完，联网补报时照常扣费，所以余额最多比透支额度再低「活跃设备数 × cap_runs × 单价」。离线可用次数设得越大，可能超出得越多。
 7. 余额只能通过充值(内部后台)和上报扣费变化，按 id 顺序累加流水金额等于当前余额。
 8. `ValidateApp`、`OnReassign` 仍用 `Noop` 的留桩实现；计费细则同步后在 `KeyBilling` 上扩展，service层不用改。
 
@@ -720,25 +722,27 @@ services:
 
 ### 集成测试(连本地MySQL，没设 `AFU_TEST_DSN` 就跳过)
 
-> 测试会清空 installs、reports、measurements 三张表，`AFU_TEST_DSN` 必须指向专用测试库。
+> 测试会清空 installs、reports、measurements、app_keys、billing_ledger 五张表，`AFU_TEST_DSN` 必须指向专用测试库。
 
-| 场景                                           | 期望                                                                                                                              |
-| ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------- |
-| app_key 不存在、已停用、大小写不同             | 403 invalid_app_key，不入库、不扣费                                                                                               |
-| 新install_id注册                               | ack，seq = 0，cap = 单次测量额度                                                                                                  |
-| 已存在的install_id注册                         | refused(conflict)，install_id为新编号且已入库                                                                                     |
-| 正常上报                                       | ack，已确认seq和counters更新                                                                                                      |
-| 重复seq                                        | ack，不新增reports行，不调用Charge                                                                                                |
-| 计数变小                                       | 已确认counters不变，增量按0，记录异常日志                                                                                         |
-| 空上报                                         | ack，增量为0                                                                                                                      |
-| 未知install_id上报                             | refused(unregistered)，新记录以本次counters为基线                                                                                 |
-| 同一install_id并发上报                         | 串行处理，只扣一次                                                                                                                |
-| App Key 单价0.50元、余额1.00元、透支额度1.00元 | 余额依次0.50 → 0 → −0.50(透支) → −1.00(停发，cap = 已确认)；重复上报、空上报不扣费；每笔扣费一条流水；停发后注册 cap = 0；预警2次 |
-| 20台设备并发上报同一个 App Key(单价0.01元)     | 余额正好少0.20元，流水合计−0.20元，计费次数20                                                                                     |
+| 场景                                           | 期望                                                                                                                                   |
+| ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
+| app_key 不存在、已停用、大小写不同             | 403 invalid_app_key，不入库、不扣费                                                                                                    |
+| 新install_id注册                               | ack，seq = 0，acked_sessions = 0，cap_frames = 0，cap_runs = App Key 的离线可用次数(默认5)                                             |
+| 后台改离线可用次数(5 → 3 → 0)                  | 下一次注册、上报、重复上报的 cap_runs 就是新值；acked_sessions = 已确认的累计计次                                                      |
+| 一份上报新增的计次超过 cap_runs                | 照常入库扣费，记一条 `sessions delta exceeds cap_runs` 日志                                                                            |
+| 已存在的install_id注册                         | refused(conflict)，install_id为新编号且已入库                                                                                          |
+| 正常上报                                       | ack，acked_sessions = 已确认的累计计次；已确认seq和counters更新；上报记录带本次增量                                                    |
+| 重复seq                                        | ack，acked_sessions 不变，不新增reports行，不调用Charge                                                                                |
+| 计数变小                                       | 已确认counters不变，增量按0，记录异常日志                                                                                              |
+| 空上报                                         | ack，增量为0                                                                                                                           |
+| 未知install_id上报                             | refused(unregistered)，acked_sessions = 本次计次；新记录以本次counters为基线，上报记录的增量为0                                        |
+| 同一install_id并发上报                         | 串行处理，只扣一次                                                                                                                     |
+| App Key 单价0.50元、余额1.00元、透支额度1.00元 | 余额依次0.50 → 0 → −0.50(透支) → −1.00(停发，cap_runs = 0)；重复上报、空上报不扣费；每笔扣费一条流水；停发后注册 cap_runs = 0；预警2次 |
+| 20台设备并发上报同一个 App Key(单价0.01元)     | 余额正好少0.20元，流水合计−0.20元，计费次数20                                                                                          |
 
 ### 端到端
 
-`cmd/fakeclient` 用测试公钥模拟SDK：注册 → 上报(`-reports N` 次，默认1) → 重复上报 → 空上报 → 重复注册换号 → 未知编号上报换号，逐步打印解密后的响应。客户端联调前先用它跑通，SDK同学可以对照它的报文排查问题。
+`cmd/fakeclient` 用测试公钥模拟SDK：注册 → 上报(`-reports N` 次，默认1) → 重复上报 → 空上报 → 断网攒3次后一份补报 → 重复注册换号 → 未知编号上报换号，逐步打印解密后的响应。客户端联调前先用它跑通，SDK同学可以对照它的报文排查问题。
 
 ## 开发顺序
 
@@ -748,14 +752,14 @@ services:
 | 2    | envelope、protocol、handler通用10步(service用假实现)              | 单元测试全过；fakeclient能拿到解密后的假响应   |
 | 3    | store + 注册处理                                                  | 注册两个集成测试场景通过                       |
 | 4    | 上报处理：事务、行锁、增量、只增不减、换号                        | 上报相关集成测试场景通过                       |
-| 5    | 计费桩、cap计算                                                   | 「无额度」场景通过                             |
+| 5    | 计费桩、回复字段计算                                              | 「无额度」场景通过                             |
 | 6    | fakeclient端到端、与SDK联调                                       | 客户端用测试密钥跑通注册和上报                 |
 | 7    | 计费细则同步后：计费、预警通知、app_key校验                       | 随细则定                                       |
 
 ## 待定
 
-1. 计费细则：单次测量额度的值、客户与App Key的关系、预警通知渠道。按次计费(单价、余额、透支额度、充值、流水)已实现(`billing.KeyBilling`)，其余规则待同步。
+1. 计费细则：客户与App Key的关系、预警通知渠道。按次计费(单价、余额、透支额度、充值、流水)已实现(`billing.KeyBilling`)，其余规则待同步。
 2. 请求体超限的错误码：readme未定义，暂按bad_request实现。
-3. ttl_sec、report_sec的语义：暂取配置值原样下发。
+3. ttl_sec：默认0，表示额度不限时；非0时过期后SDK怎么处理还没定义。report_sec：SDK 不用，照常下发。
 4. 部署：https在服务里终止还是由前置负载均衡处理；阿福转发阶段的身份认证；限流。
 5. 已知风险：克隆设备用同一个install_id时，落后的一台会被当成重试而不扣费。

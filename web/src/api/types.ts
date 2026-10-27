@@ -10,8 +10,6 @@ export interface Me {
 }
 
 export interface Meta {
-  per_measure_frames: number
-  per_measure_runs: number
   ttl_sec: number
   report_sec: number
   active_kids: number[]
@@ -62,7 +60,7 @@ export interface Install {
   updated_at: string
 }
 
-/** 上报明文里的单次测量 */
+/** 上报明文里的一条计次记录 */
 export interface ReportedMeasurement {
   no: number
   start_ts: number
@@ -78,7 +76,7 @@ export interface Report {
   client_ts: number
   received_at: string
   counters: Counters // 从明文解析，累计值
-  measurements: ReportedMeasurement[] // 本次上报带的测量；空上报为[]
+  measurements: ReportedMeasurement[] // 本次上报带的计次记录；空上报为[]
   charge: number // 本次上报扣的钱，0.0001元；没扣费为0
   payload?: unknown // 原始明文，只有详情接口返回
 }
@@ -92,7 +90,8 @@ export interface AppKey {
   unit_price: number // 单价/次，0为不收费
   balance: number // 余额，透支时为负
   overdraft_limit: number // 透支额度
-  used_count: number // 累计计费测量次数
+  used_count: number // 累计计费的计次
+  offline_runs: number // 离线可用次数：从已确认往后还能新增几次计次，cap_runs 直接下发
   billing_state: 'free' | 'normal' | 'overdraft' | 'exhausted'
   created_by: string
   created_at: string

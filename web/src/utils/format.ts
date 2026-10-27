@@ -13,7 +13,7 @@ export function fmtDuration(ms: number): string {
   return `${h}:${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}`
 }
 
-/** 测量时长不超过5秒算「短测量」，见 readme.md「使用规则」第2条 */
+/** 一条计次记录的时长不超过5秒算异常：窗口内测满5秒(不含)才计次，见 readme.md「使用规则 / 计次」第1条 */
 export const SHORT_DT_MS = 5000
 
 export const RESET_REASON_LABEL: Record<string, string> = {

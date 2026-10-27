@@ -69,13 +69,15 @@ type ReportReq struct {
 	Measurements []Measurement `json:"measurements"`
 }
 
+// Ack 的 acked_sessions、cap_runs 是 SDK 算额度用的：可用 = acked_sessions + cap_runs − 本地累计 − 预留。
 type Ack struct {
-	InstallID string `json:"install_id"`
-	Seq       uint64 `json:"seq"`
-	CapFrames uint64 `json:"cap_frames"`
-	CapRuns   uint64 `json:"cap_runs"`
-	TTLSec    int    `json:"ttl_sec"`
-	ReportSec int    `json:"report_sec"`
+	InstallID     string `json:"install_id"`
+	Seq           uint64 `json:"seq"`
+	AckedSessions uint64 `json:"acked_sessions"` // 服务端已确认的累计计次
+	CapFrames     uint64 `json:"cap_frames"`     // 固定为0，不按帧数限制
+	CapRuns       uint64 `json:"cap_runs"`       // 从 acked_sessions 往后还能新增几次计次
+	TTLSec        int    `json:"ttl_sec"`        // 0 表示不限时
+	ReportSec     int    `json:"report_sec"`
 }
 
 // Refused = ack全部字段 + reason。

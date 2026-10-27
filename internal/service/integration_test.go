@@ -1,6 +1,7 @@
 package service
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -8,6 +9,7 @@ import (
 	"log/slog"
 	"math"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -65,7 +67,7 @@ func setup(t *testing.T) (*Service, *countingBilling, *gorm.DB) {
 			t.Fatal(err)
 		}
 	}
-	if err := db.Create(&store.AppKey{AppKey: "AK-demo", Status: store.AppKeyEnabled}).Error; err != nil {
+	if err := db.Create(&store.AppKey{AppKey: "AK-demo", Status: store.AppKeyEnabled, OfflineRuns: store.DefaultOfflineRuns}).Error; err != nil {
 		t.Fatal(err)
 	}
 	b := &countingBilling{}
@@ -107,6 +109,15 @@ func mustInstall(t *testing.T, db *gorm.DB, id string) store.Install {
 	return inst
 }
 
+func mustReport(t *testing.T, db *gorm.DB, id string, seq uint64) store.Report {
+	t.Helper()
+	var r store.Report
+	if err := db.Where("install_id = ? AND seq = ?", id, seq).Take(&r).Error; err != nil {
+		t.Fatalf("查上报记录 %s seq=%d: %v", id, seq, err)
+	}
+	return r
+}
+
 func count(t *testing.T, db *gorm.DB, model any, where string, args ...any) int64 {
 	t.Helper()
 	var n int64
@@ -124,7 +135,7 @@ func TestIntegrationRegister(t *testing.T) {
 	if err != nil || typ != protocol.TypeAck {
 		t.Fatalf("新编号注册: %s %v", typ, err)
 	}
-	if a := resp.(protocol.Ack); a.Seq != 0 || a.CapFrames != 300 || a.CapRuns != 10 {
+	if a := resp.(protocol.Ack); a.Seq != 0 || a.AckedSessions != 0 || a.CapFrames != 0 || a.CapRuns != 5 {
 		t.Fatalf("ack = %+v", a)
 	}
 
@@ -133,11 +144,64 @@ func TestIntegrationRegister(t *testing.T) {
 		t.Fatalf("重复注册: %s %v", typ, err)
 	}
 	r := resp.(protocol.Refused)
-	if r.Reason != protocol.ReasonConflict || r.InstallID == testInstallID || r.CapFrames != 300 {
+	if r.Reason != protocol.ReasonConflict || r.InstallID == testInstallID || r.AckedSessions != 0 || r.CapRuns != 5 {
 		t.Fatalf("refused = %+v", r)
 	}
 	if inst := mustInstall(t, db, r.InstallID); inst.ResetReason != protocol.ReasonConflict {
 		t.Fatalf("新编号的reset_reason = %q", inst.ResetReason)
+	}
+}
+
+// 离线可用次数跟 App Key 绑定：改了之后下一次回复就按新值下发 cap_runs；acked_sessions 是已确认的累计计次。
+func TestIntegrationOfflineRuns(t *testing.T) {
+	s, _, db := setup(t)
+	ctx := context.Background()
+	setRuns := func(n uint64) {
+		t.Helper()
+		if err := db.Model(&store.AppKey{}).Where("app_key = ?", "AK-demo").Update("offline_runs", n).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	setRuns(3)
+	if _, resp, err := s.Register(ctx, registerReq(testInstallID)); err != nil || resp.(protocol.Ack).CapRuns != 3 {
+		t.Fatalf("注册: %+v %v", resp, err)
+	}
+	for seq := uint64(1); seq <= 2; seq++ {
+		rep := reportReq(testInstallID, seq, 300*seq, 10*seq) // 累计计次 = seq
+		if _, resp, err := s.Report(ctx, rep, raw(t, rep)); err != nil {
+			t.Fatal(err)
+		} else if a := resp.(protocol.Ack); a.Seq != seq || a.AckedSessions != seq || a.CapRuns != 3 || a.CapFrames != 0 {
+			t.Fatalf("上报seq=%d: %+v", seq, a)
+		}
+	}
+
+	// 改成0：重复上报也按新值回复，SDK 收到后不能再开新窗口
+	setRuns(0)
+	rep := reportReq(testInstallID, 2, 600, 20)
+	if _, resp, err := s.Report(ctx, rep, raw(t, rep)); err != nil {
+		t.Fatal(err)
+	} else if a := resp.(protocol.Ack); a.Seq != 2 || a.AckedSessions != 2 || a.CapRuns != 0 {
+		t.Fatalf("重复上报: %+v", a)
+	}
+}
+
+// 一份上报新增的计次超过 cap_runs：照常入库扣费，记一条异常日志。
+func TestIntegrationSessionsOverCap(t *testing.T) {
+	_, b, db := setup(t)
+	var buf bytes.Buffer
+	s := New(db, b, billing.LogNotifier{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, meterCfg,
+		slog.New(slog.NewTextHandler(&buf, nil)))
+	ctx := context.Background()
+	s.Register(ctx, registerReq(testInstallID))
+
+	rep := reportReq(testInstallID, 1, 300, 10)
+	rep.Counters.Sessions = 6 // cap_runs 是5
+	if _, resp, err := s.Report(ctx, rep, raw(t, rep)); err != nil || resp.(protocol.Ack).AckedSessions != 6 {
+		t.Fatalf("%+v %v", resp, err)
+	}
+	if !strings.Contains(buf.String(), "sessions delta exceeds cap_runs") || b.chargeCount() != 1 {
+		t.Fatalf("应记异常日志并照常扣费: %s", buf.String())
 	}
 }
 
@@ -151,11 +215,14 @@ func TestIntegrationReport(t *testing.T) {
 	if err != nil || typ != protocol.TypeAck {
 		t.Fatalf("正常上报: %s %v", typ, err)
 	}
-	if a := resp.(protocol.Ack); a.Seq != 1 || a.CapFrames != 600 || a.CapRuns != 20 {
+	if a := resp.(protocol.Ack); a.Seq != 1 || a.AckedSessions != 1 || a.CapFrames != 0 || a.CapRuns != 5 {
 		t.Fatalf("ack = %+v", a)
 	}
 	if inst := mustInstall(t, db, testInstallID); inst.ConfirmedSeq != 1 || inst.CFramesOK != 300 {
 		t.Fatalf("已确认 = %+v", inst)
+	}
+	if d := mustReport(t, db, testInstallID, 1); d.DeltaSessions != 1 || d.DeltaFrames != 300 || d.DeltaDtMs != 300*33 {
+		t.Fatalf("上报记录的增量 = %+v", d)
 	}
 	if n := count(t, db, &store.Measurement{}, "install_id = ?", testInstallID); n != 1 {
 		t.Fatalf("measurements = %d", n)
@@ -164,7 +231,7 @@ func TestIntegrationReport(t *testing.T) {
 	t.Run("重复seq不入库不扣费", func(t *testing.T) {
 		before := b.chargeCount()
 		typ, resp, err := s.Report(ctx, r1, raw(t, r1))
-		if err != nil || typ != protocol.TypeAck || resp.(protocol.Ack).Seq != 1 {
+		if err != nil || typ != protocol.TypeAck || resp.(protocol.Ack).Seq != 1 || resp.(protocol.Ack).AckedSessions != 1 {
 			t.Fatalf("%s %+v %v", typ, resp, err)
 		}
 		if b.chargeCount() != before || count(t, db, &store.Report{}, "install_id = ?", testInstallID) != 1 {
@@ -195,9 +262,12 @@ func TestIntegrationReport(t *testing.T) {
 		if d := b.charges[len(b.charges)-1]; d != (protocol.Counters{}) {
 			t.Fatalf("增量 = %+v", d)
 		}
+		if d := mustReport(t, db, testInstallID, 3); d.DeltaSessions != 0 || d.DeltaFrames != 0 || d.DeltaDtMs != 0 {
+			t.Fatalf("上报记录的增量 = %+v", d)
+		}
 	})
 
-	t.Run("无额度时cap等于已确认", func(t *testing.T) {
+	t.Run("无额度时cap_runs为0", func(t *testing.T) {
 		b.noQuota = true
 		defer func() { b.noQuota = false }()
 		r4 := reportReq(testInstallID, 4, 600, 20)
@@ -205,7 +275,7 @@ func TestIntegrationReport(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if a := resp.(protocol.Ack); a.CapFrames != 600 || a.CapRuns != 20 {
+		if a := resp.(protocol.Ack); a.CapRuns != 0 {
 			t.Fatalf("ack = %+v", a)
 		}
 	})
@@ -222,7 +292,7 @@ func TestIntegrationReportUnknownInstall(t *testing.T) {
 	}
 	ref := resp.(protocol.Refused)
 	if ref.Reason != protocol.ReasonUnregistered || ref.InstallID == testInstallID || ref.Seq != 5 ||
-		ref.CapFrames != 1800 || ref.CapRuns != 60 {
+		ref.AckedSessions != 5 || ref.CapFrames != 0 || ref.CapRuns != 5 { // acked_sessions 取这份上报的计次(基线)
 		t.Fatalf("refused = %+v", ref)
 	}
 	inst := mustInstall(t, db, ref.InstallID)
@@ -232,8 +302,8 @@ func TestIntegrationReportUnknownInstall(t *testing.T) {
 	if b.chargeCount() != 0 {
 		t.Fatal("换号时不走Charge")
 	}
-	if count(t, db, &store.Report{}, "install_id = ? AND seq = ?", ref.InstallID, 5) != 1 {
-		t.Fatal("触发换号的上报应以新编号保存")
+	if d := mustReport(t, db, ref.InstallID, 5); d.DeltaSessions != 0 || d.DeltaFrames != 0 {
+		t.Fatalf("触发换号的上报应以新编号保存，增量为0(基线): %+v", d)
 	}
 
 	// 客户端换上新编号后，下一份上报只算新增用量
@@ -334,14 +404,14 @@ func TestIntegrationKeyBilling(t *testing.T) {
 	s := New(db, billing.KeyBilling{DB: db}, notifier, meterCfg, log)
 
 	// 单价0.50元，余额1.00元，透支额度1.00元
-	key := store.AppKey{AppKey: "AK-bill", Status: store.AppKeyEnabled, UnitPrice: uint64(yuan(0.5)),
+	key := store.AppKey{AppKey: "AK-bill", Status: store.AppKeyEnabled, OfflineRuns: 10, UnitPrice: uint64(yuan(0.5)),
 		Balance: yuan(1), OverdraftLimit: uint64(yuan(1))}
 	if err := db.Create(&key).Error; err != nil {
 		t.Fatal(err)
 	}
 	reg := registerReq(testInstallID)
 	reg.AppKey = "AK-bill"
-	if _, resp, err := s.Register(ctx, reg); err != nil || resp.(protocol.Ack).CapFrames != 300 {
+	if _, resp, err := s.Register(ctx, reg); err != nil || resp.(protocol.Ack).CapRuns != 10 {
 		t.Fatalf("注册: %+v %v", resp, err)
 	}
 
@@ -366,23 +436,24 @@ func TestIntegrationKeyBilling(t *testing.T) {
 	steps := []struct {
 		seq, sessions uint64
 		measurement   bool
-		capFrames     uint64
+		capRuns       uint64
 		balance       int64
 		state         string
 		name          string
 	}{
-		{1, 1, true, 600, yuan(0.5), store.BillingNormal, "扣0.50"},
-		{2, 2, true, 900, 0, store.BillingNormal, "余额扣到0"},
-		{3, 3, true, 1200, yuan(-0.5), store.BillingOverdraft, "进入透支，还够付下一次"},
-		{4, 4, true, 1200, yuan(-1), store.BillingExhausted, "透支用完，停发"},
-		{4, 4, true, 1200, yuan(-1), store.BillingExhausted, "重复上报不扣费"},
-		{5, 4, false, 1200, yuan(-1), store.BillingExhausted, "空上报不扣费"},
+		{1, 1, true, 10, yuan(0.5), store.BillingNormal, "扣0.50"},
+		{2, 2, true, 10, 0, store.BillingNormal, "余额扣到0"},
+		{3, 3, true, 10, yuan(-0.5), store.BillingOverdraft, "进入透支，还够付下一次"},
+		{4, 4, true, 0, yuan(-1), store.BillingExhausted, "透支用完，停发"},
+		{4, 4, true, 0, yuan(-1), store.BillingExhausted, "重复上报不扣费"},
+		{5, 4, false, 0, yuan(-1), store.BillingExhausted, "空上报不扣费"},
 	}
 	for _, st := range steps {
 		a := report(st.seq, st.sessions, st.measurement)
 		k := balance()
-		if a.CapFrames != st.capFrames || k.Balance != st.balance || k.BillingState() != st.state {
-			t.Fatalf("%s: cap_frames=%d balance=%d state=%s", st.name, a.CapFrames, k.Balance, k.BillingState())
+		if a.AckedSessions != st.sessions || a.CapRuns != st.capRuns || a.CapFrames != 0 || k.Balance != st.balance ||
+			k.BillingState() != st.state {
+			t.Fatalf("%s: acked=%d cap_runs=%d balance=%d state=%s", st.name, a.AckedSessions, a.CapRuns, k.Balance, k.BillingState())
 		}
 	}
 	if k := balance(); k.UsedCount != 4 {
@@ -405,7 +476,7 @@ func TestIntegrationKeyBilling(t *testing.T) {
 	// 停发后新设备注册拿不到额度
 	reg2 := registerReq("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	reg2.AppKey = "AK-bill"
-	if _, resp, _ := s.Register(ctx, reg2); resp.(protocol.Ack).CapFrames != 0 {
+	if _, resp, _ := s.Register(ctx, reg2); resp.(protocol.Ack).CapRuns != 0 {
 		t.Fatalf("停发后注册的 cap = %+v", resp)
 	}
 

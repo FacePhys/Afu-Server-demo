@@ -46,11 +46,11 @@ const (
 	KeyRetired = "retired"
 )
 
+// MeterConfig 原样下发给 SDK 的参数。ttl_sec 为0表示额度不限时；report_sec SDK 不用，照常下发。
+// cap_runs 由 App Key 的离线可用次数决定，cap_frames 固定为0(不按帧数限制)。
 type MeterConfig struct {
-	PerMeasureFrames uint64 `yaml:"per_measure_frames"` // 单次测量额度(帧)
-	PerMeasureRuns   uint64 `yaml:"per_measure_runs"`   // 单次测量额度(run)
-	TTLSec           int    `yaml:"ttl_sec"`
-	ReportSec        int    `yaml:"report_sec"`
+	TTLSec    int `yaml:"ttl_sec"`
+	ReportSec int `yaml:"report_sec"`
 }
 
 // AdminConfig 是内部数据后台的配置，见 docs/internal-console.md。
@@ -100,8 +100,8 @@ func (c *Config) validate() error {
 	if c.Server.MaxBodyBytes <= 0 {
 		errs = append(errs, errors.New("server.max_body_bytes 必须大于0"))
 	}
-	if c.Meter.PerMeasureFrames == 0 || c.Meter.PerMeasureRuns == 0 {
-		errs = append(errs, errors.New("meter.per_measure_frames / per_measure_runs 必须大于0"))
+	if c.Meter.TTLSec < 0 || c.Meter.ReportSec < 0 {
+		errs = append(errs, errors.New("meter.ttl_sec、meter.report_sec 不能为负数"))
 	}
 	active := 0
 	for _, k := range c.Keys {

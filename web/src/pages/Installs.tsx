@@ -38,7 +38,7 @@ export default function Installs() {
     { title: 'sdk', dataIndex: 'sdk' },
     { title: '新安装原因', dataIndex: 'reset_reason', render: (v: string) => <ResetReasonTag reason={v} /> },
     { title: '已确认seq', dataIndex: 'confirmed_seq', align: 'right' },
-    { title: '测量次数', key: 'sessions', align: 'right', render: (_, r) => fmtNum(r.counters.sessions) },
+    { title: '累计计次', key: 'sessions', align: 'right', render: (_, r) => fmtNum(r.counters.sessions) },
     { title: '测量时长', key: 'dt_ms', align: 'right', render: (_, r) => fmtDuration(r.counters.dt_ms) },
     { title: '创建时间', dataIndex: 'created_at', render: fmtTime },
     {

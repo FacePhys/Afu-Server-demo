@@ -13,7 +13,8 @@ import (
 // Register 处理注册：不先查再插，直接插入，用唯一键判断install_id是否已存在，天然处理并发。
 // 已存在时换号(不记录旧编号)，返回refused(conflict)。
 func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (string, any, error) {
-	if err := s.checkAppKey(ctx, req.InstallID, req.AppKey); err != nil {
+	key, err := s.loadAppKey(ctx, req.InstallID, req.AppKey)
+	if err != nil {
 		return "", nil, err
 	}
 	if err := s.billing.ValidateApp(ctx, req.AppKey, req.AppID); err != nil { // 留桩：放行
@@ -29,7 +30,7 @@ func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (strin
 		Platform: req.Platform, SDK: req.SDK, ResetReason: req.Reset}
 	err = db.Create(&inst).Error
 	if err == nil {
-		return protocol.TypeAck, s.ack(inst.InstallID, 0, protocol.Counters{}, hasQuota), nil
+		return protocol.TypeAck, s.ack(inst.InstallID, 0, 0, key, hasQuota), nil
 	}
 	if !errors.Is(err, gorm.ErrDuplicatedKey) {
 		return "", nil, err
@@ -41,5 +42,5 @@ func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (strin
 		return "", nil, err
 	}
 	s.log.Info("install_id reassigned", "reason", protocol.ReasonConflict, "old", req.InstallID, "new", newInst.InstallID)
-	return protocol.TypeRefused, s.refused(newInst.InstallID, 0, protocol.Counters{}, hasQuota, protocol.ReasonConflict), nil
+	return protocol.TypeRefused, s.refused(newInst.InstallID, 0, 0, key, hasQuota, protocol.ReasonConflict), nil
 }

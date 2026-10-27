@@ -39,8 +39,7 @@ func New(db *gorm.DB, cfg config.AdminConfig, meter config.MeterConfig, activeKi
 	}
 	kids := slices.Clone(activeKids)
 	slices.Sort(kids)
-	meta := Meta{PerMeasureFrames: meter.PerMeasureFrames, PerMeasureRuns: meter.PerMeasureRuns,
-		TTLSec: meter.TTLSec, ReportSec: meter.ReportSec, ActiveKids: kids, Version: buildVersion()}
+	meta := Meta{TTLSec: meter.TTLSec, ReportSec: meter.ReportSec, ActiveKids: kids, Version: buildVersion()}
 	return &Server{db: db, tokens: tokens, meta: meta, static: static, log: log, now: time.Now}, nil
 }
 

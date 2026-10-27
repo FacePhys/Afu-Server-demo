@@ -17,7 +17,7 @@ func TestLoadExample(t *testing.T) {
 	if cfg.Server.ReadTimeout != 5*time.Second || cfg.Server.MaxBodyBytes != 65536 {
 		t.Fatalf("server = %+v", cfg.Server)
 	}
-	if cfg.Meter.PerMeasureFrames != 300 || cfg.Meter.TTLSec != 86400 {
+	if cfg.Meter.TTLSec != 0 || cfg.Meter.ReportSec != 60 { // ttl_sec 为0：额度不限时
 		t.Fatalf("meter = %+v", cfg.Meter)
 	}
 	if len(cfg.Keys) != 1 || cfg.Keys[0].Status != KeyActive {
@@ -42,10 +42,18 @@ func TestValidate(t *testing.T) {
 	os.WriteFile(path, []byte(`
 db: {dsn: "x"}
 keys: [{kid: 1, private_key_file: a, status: unknown}]
-meter: {per_measure_frames: 0, per_measure_runs: 10}
 `), 0o600)
 	if _, err := Load(path); err == nil {
-		t.Fatal("非法status、额度为0、没有active密钥都应报错")
+		t.Fatal("非法status、没有active密钥都应报错")
+	}
+
+	os.WriteFile(path, []byte(`
+db: {dsn: "x"}
+keys: [{kid: 1, private_key_file: a, status: active}]
+meter: {ttl_sec: -1}
+`), 0o600)
+	if _, err := Load(path); err == nil {
+		t.Fatal("ttl_sec 为负数应报错")
 	}
 }
 
@@ -54,7 +62,6 @@ func TestAdminValidate(t *testing.T) {
 	base := `
 db: {dsn: "x"}
 keys: [{kid: 1, private_key_file: a, status: active}]
-meter: {per_measure_frames: 300, per_measure_runs: 10}
 `
 	cases := map[string]struct {
 		admin string

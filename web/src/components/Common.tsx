@@ -16,7 +16,7 @@ export function ResetReasonTag({ reason }: { reason: string }) {
   return <Tag color={reassigned ? 'blue' : undefined}>{RESET_REASON_LABEL[reason] ?? reason}</Tag>
 }
 
-/** 测量时长；不超过5秒的标橙色 */
+/** 计次记录的时长；不超过5秒的标橙色(SDK 不该发) */
 export function DurationText({ ms }: { ms: number }) {
   return ms <= SHORT_DT_MS ? <Tag color="orange">{fmtDuration(ms)}</Tag> : <span>{fmtDuration(ms)}</span>
 }

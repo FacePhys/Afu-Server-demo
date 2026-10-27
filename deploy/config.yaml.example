@@ -15,11 +15,9 @@ keys:                           # 私钥放在 keys/ 目录，见 gen-keys.sh
     private_key_file: "/app/keys/kid1.pem"
     status: active
 
-meter:
-  per_measure_frames: 300       # 单次测量额度(帧)，等算法给值
-  per_measure_runs: 10
-  ttl_sec: 86400
-  report_sec: 60
+meter:                          # 原样下发给SDK；cap_runs 由 App Key 的离线可用次数决定(后台配置)
+  ttl_sec: 0                    # 0 = 额度不限时
+  report_sec: 60                # SDK 不用，照常下发
 
 log:
   level: info

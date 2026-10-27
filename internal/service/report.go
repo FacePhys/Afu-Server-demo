@@ -13,7 +13,7 @@ import (
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
 )
 
-// minBilledDtMs 以上的测量才会上报，见 readme.md「使用规则」第2条。
+// minBilledDtMs 窗口内测满这么久(不含)才计次，见 readme.md「使用规则 / 计次」第1条；一条 measurement 是一次计次，不该小于等于它。
 const minBilledDtMs = 5000
 
 type reportResult struct {
@@ -21,7 +21,7 @@ type reportResult struct {
 	reason    string // 换号时为 unregistered
 	installID string
 	seq       uint64
-	counters  protocol.Counters
+	acked     uint64 // 已确认的累计计次，回复的 acked_sessions
 	appKey    string
 	needQuota bool // 重复上报、换号：事务提交后再查额度
 	charge    billing.ChargeResult
@@ -30,7 +30,8 @@ type reportResult struct {
 // Report 处理上报：一个事务完成，按install_id加行锁串行处理。
 // 隔离级别用 READ COMMITTED：FOR UPDATE 查不到行时不加间隙锁，避免并发换号时死锁。
 func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte) (string, any, error) {
-	if err := s.checkAppKey(ctx, req.InstallID, req.AppKey); err != nil {
+	key, err := s.loadAppKey(ctx, req.InstallID, req.AppKey)
+	if err != nil {
 		return "", nil, err
 	}
 	for _, m := range req.Measurements {
@@ -40,7 +41,7 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 	}
 
 	var res reportResult
-	err := s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
+	err = s.db.WithContext(ctx).Transaction(func(tx *gorm.DB) error {
 		var inst store.Install
 		err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).
 			Where("install_id = ?", req.InstallID).Take(&inst).Error
@@ -54,19 +55,22 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 
 		// 重复上报：不入库、不扣费，按当前状态回ack
 		if req.Seq <= inst.ConfirmedSeq {
-			res.seq, res.counters, res.needQuota = inst.ConfirmedSeq, inst.Counters(), true
+			res.seq, res.acked, res.needQuota = inst.ConfirmedSeq, inst.CSessions, true
 			return nil
-		}
-
-		if err := saveReport(tx, inst.InstallID, req, raw); err != nil {
-			return err
 		}
 
 		delta, regressed := protocol.Delta(inst.Counters(), req.Counters) // 每项 max(0, 新 - 旧)
 		if regressed {
 			s.log.Warn("counters regressed", "install_id", inst.InstallID, "seq", req.Seq)
 		}
-		charge, err := s.billing.Charge(ctx, tx, billing.ChargeRequest{ // 按新增测量次数扣费、判断额度
+		if delta.Sessions > key.OfflineRuns { // SDK 最多先用 cap_runs 次，超了说明 SDK 被改过或有 bug
+			s.log.Warn("sessions delta exceeds cap_runs", "install_id", inst.InstallID, "seq", req.Seq,
+				"delta", delta.Sessions, "cap_runs", key.OfflineRuns)
+		}
+		if err := saveReport(tx, inst.InstallID, req, raw, delta); err != nil {
+			return err
+		}
+		charge, err := s.billing.Charge(ctx, tx, billing.ChargeRequest{ // 按新增计次扣费、判断额度
 			AppKey: req.AppKey, InstallID: inst.InstallID, Seq: req.Seq, Delta: delta})
 		if err != nil {
 			return err
@@ -77,7 +81,7 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 			Updates(store.ConfirmedUpdates(req.Seq, confirmed)).Error; err != nil { // map，零值也会写入
 			return err
 		}
-		res.seq, res.counters, res.charge = req.Seq, confirmed, charge
+		res.seq, res.acked, res.charge = req.Seq, confirmed.Sessions, charge
 		return nil
 	}, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
 	if err != nil {
@@ -95,9 +99,9 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 	}
 
 	if res.respType == protocol.TypeRefused {
-		return protocol.TypeRefused, s.refused(res.installID, res.seq, res.counters, hasQuota, res.reason), nil
+		return protocol.TypeRefused, s.refused(res.installID, res.seq, res.acked, key, hasQuota, res.reason), nil
 	}
-	return protocol.TypeAck, s.ack(res.installID, res.seq, res.counters, hasQuota), nil
+	return protocol.TypeAck, s.ack(res.installID, res.seq, res.acked, key, hasQuota), nil
 }
 
 // reassignOnReport 服务端没有该install_id：生成新编号直接注册，以本次counters为基线，返回refused(unregistered)。
@@ -112,7 +116,7 @@ func (s *Service) reassignOnReport(ctx context.Context, tx *gorm.DB, req protoco
 	if err := s.createWithNewID(tx, &inst); err != nil {
 		return err
 	}
-	if err := saveReport(tx, inst.InstallID, req, raw); err != nil {
+	if err := saveReport(tx, inst.InstallID, req, raw, protocol.Counters{}); err != nil { // 基线，增量为0
 		return err
 	}
 	if err := s.billing.OnReassign(ctx, tx, req.AppKey, req.Measurements); err != nil { // 留桩：默认不扣
@@ -121,13 +125,15 @@ func (s *Service) reassignOnReport(ctx context.Context, tx *gorm.DB, req protoco
 	s.log.Info("install_id reassigned", "reason", protocol.ReasonUnregistered, "old", req.InstallID, "new", inst.InstallID)
 
 	*res = reportResult{respType: protocol.TypeRefused, reason: protocol.ReasonUnregistered,
-		installID: inst.InstallID, seq: req.Seq, counters: req.Counters, appKey: req.AppKey, needQuota: true}
+		installID: inst.InstallID, seq: req.Seq, acked: req.Counters.Sessions, appKey: req.AppKey, needQuota: true}
 	return nil
 }
 
-// saveReport 保存原始上报明文和measurements；重复的measurement no忽略。
-func saveReport(tx *gorm.DB, installID string, req protocol.ReportReq, raw []byte) error {
-	if err := tx.Create(&store.Report{InstallID: installID, Seq: req.Seq, ClientTS: req.TS, Payload: string(raw)}).Error; err != nil {
+// saveReport 保存原始上报明文、本次增量(后台按天统计用)和measurements；重复的measurement no忽略。
+func saveReport(tx *gorm.DB, installID string, req protocol.ReportReq, raw []byte, delta protocol.Counters) error {
+	r := store.Report{InstallID: installID, Seq: req.Seq, ClientTS: req.TS, Payload: string(raw),
+		DeltaSessions: delta.Sessions, DeltaFrames: delta.FramesOK, DeltaDtMs: delta.DtMs}
+	if err := tx.Create(&r).Error; err != nil {
 		return err
 	}
 	ms := store.ToMeasurements(installID, req.Seq, req.Measurements)

@@ -12,7 +12,7 @@ const columns: TableColumnsType<DayStat> = [
   { title: '日期', dataIndex: 'date' },
   { title: '新增安装', dataIndex: 'new_installs', align: 'right', render: fmtNum },
   { title: '上传次数', dataIndex: 'reports', align: 'right', render: fmtNum },
-  { title: '测量次数', dataIndex: 'measurements', align: 'right', render: fmtNum },
+  { title: '计次', dataIndex: 'measurements', align: 'right', render: fmtNum },
   { title: '有效帧数', dataIndex: 'frames', align: 'right', render: fmtNum },
   { title: '测量时长', dataIndex: 'dt_ms', align: 'right', render: fmtDuration },
 ]

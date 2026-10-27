@@ -64,7 +64,7 @@ export default function InstallDetail() {
           column={{ xs: 2, md: 4 }}
           items={[
             { label: '已确认seq', children: d.confirmed_seq },
-            { label: '测量次数', children: fmtNum(c.sessions) },
+            { label: '累计计次', children: fmtNum(c.sessions) },
             { label: '有效帧数', children: fmtNum(c.frames_ok) },
             { label: 'run次数', children: fmtNum(c.run_ok) },
             { label: '测量时长', children: fmtDuration(c.dt_ms) },

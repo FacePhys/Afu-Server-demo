@@ -27,17 +27,16 @@ import { fmtNum } from '../utils/format'
 import { fmtYuan, unitsToYuan, yuanToUnits } from '../utils/money'
 import { fmtTime } from '../utils/time'
 
-interface CreateForm {
-  remark?: string
-  app_key?: string
+interface ConfigForm {
   unit_price?: number | null
-  initial_balance?: number | null
   overdraft_limit?: number | null
+  offline_runs?: number | null
 }
 
-interface PriceForm {
-  unit_price?: number | null
-  overdraft_limit?: number | null
+interface CreateForm extends ConfigForm {
+  remark?: string
+  app_key?: string
+  initial_balance?: number | null
 }
 
 interface RechargeForm {
@@ -54,19 +53,27 @@ const BILLING_TAG: Record<AppKey['billing_state'], { color?: string; text: strin
 
 const yuanInput = { min: 0, precision: 4, style: { width: '100%' }, suffix: '元' }
 
-/** 单价、透支额度两个输入框，创建和修改定价共用 */
-function PriceFields() {
+/** 单价、透支额度、离线可用次数，创建和修改配置共用 */
+function ConfigFields() {
   return (
     <>
-      <Form.Item name="unit_price" label="单价(每次测量)" extra="每次上报按「新增测量次数 × 单价」从余额扣；留空或填 0 表示不收费。">
+      <Form.Item name="unit_price" label="单价(每次计次)" extra="每次上报按「新增计次 × 单价」从余额扣；留空或填 0 表示不收费。">
         <InputNumber {...yuanInput} placeholder="0" />
       </Form.Item>
       <Form.Item
         name="overdraft_limit"
         label="透支额度"
-        extra="余额可以扣到负数，最多透支这么多；余额加透支额度不够付下一次时停发额度，SDK 不能再开始新测量。"
+        extra="余额可以扣到负数，最多透支这么多；余额加透支额度不够付下一次时停发额度(下发 cap_runs = 0)，SDK 收到后不能再开新窗口。"
       >
         <InputNumber {...yuanInput} placeholder="0" />
+      </Form.Item>
+      <Form.Item
+        name="offline_runs"
+        label="离线可用次数"
+        extra="回复里的 cap_runs 直接下发这个值：设备不等服务端确认，最多能先用这么多次计次(断网时就靠它)，联网上报后按新增计次扣费。范围 0~16(一份上报最多 16 条)，填 0 相当于停发。"
+        rules={[{ required: true, message: '请填写离线可用次数' }]}
+      >
+        <InputNumber min={0} max={16} precision={0} style={{ width: '100%' }} suffix="次" />
       </Form.Item>
     </>
   )
@@ -126,12 +133,12 @@ export default function AppKeys() {
   const { message } = App.useApp()
   const { data, loading, error, reload } = useApi(() => apiGet<AppKeyList>('/app-keys'), [])
   const [creating, setCreating] = useState(false)
-  const [pricing, setPricing] = useState<AppKey>()
+  const [editing, setEditing] = useState<AppKey>()
   const [recharging, setRecharging] = useState<AppKey>()
   const [ledgerOf, setLedgerOf] = useState<AppKey>()
   const [saving, setSaving] = useState(false)
   const [createForm] = Form.useForm<CreateForm>()
-  const [priceForm] = Form.useForm<PriceForm>()
+  const [configForm] = Form.useForm<ConfigForm>()
   const [rechargeForm] = Form.useForm<RechargeForm>()
 
   // save 统一处理保存中、成功提示、失败提示和刷新列表
@@ -157,6 +164,7 @@ export default function AppKeys() {
           unit_price: yuanToUnits(v.unit_price),
           initial_balance: yuanToUnits(v.initial_balance),
           overdraft_limit: yuanToUnits(v.overdraft_limit),
+          offline_runs: v.offline_runs ?? 0,
         })
         return `已创建 ${k.app_key}`
       },
@@ -166,17 +174,18 @@ export default function AppKeys() {
       },
     )
 
-  const updatePrice = (v: PriceForm) =>
-    pricing &&
+  const updateConfig = (v: ConfigForm) =>
+    editing &&
     save(
       async () => {
-        await apiSend<AppKey>('PATCH', `/app-keys/${pricing.id}`, {
+        await apiSend<AppKey>('PATCH', `/app-keys/${editing.id}`, {
           unit_price: yuanToUnits(v.unit_price),
           overdraft_limit: yuanToUnits(v.overdraft_limit),
+          offline_runs: v.offline_runs ?? 0,
         })
-        return '定价已修改'
+        return '配置已修改'
       },
-      () => setPricing(undefined),
+      () => setEditing(undefined),
     )
 
   const recharge = (v: RechargeForm) =>
@@ -223,6 +232,7 @@ export default function AppKeys() {
     },
     { title: '透支额度(元)', dataIndex: 'overdraft_limit', align: 'right', render: fmtYuan },
     { title: '计费次数', dataIndex: 'used_count', align: 'right', render: fmtNum },
+    { title: '离线次数', dataIndex: 'offline_runs', align: 'right', render: fmtNum },
     {
       title: '计费',
       dataIndex: 'billing_state',
@@ -250,14 +260,15 @@ export default function AppKeys() {
             type="link"
             size="small"
             onClick={() => {
-              priceForm.setFieldsValue({
+              configForm.setFieldsValue({
                 unit_price: k.unit_price ? unitsToYuan(k.unit_price) : null,
                 overdraft_limit: unitsToYuan(k.overdraft_limit),
+                offline_runs: k.offline_runs,
               })
-              setPricing(k)
+              setEditing(k)
             }}
           >
-            修改定价
+            修改配置
           </Button>
           <Button type="link" size="small" onClick={() => setLedgerOf(k)}>
             流水
@@ -288,7 +299,7 @@ export default function AppKeys() {
     <Flex vertical gap={16}>
       <Flex justify="space-between" align="center">
         <span style={{ color: '#999' }}>
-          注册、上报带的 app_key 必须是这里已启用的 App Key，否则返回 403。按次计费：每次上报按新增测量次数 × 单价从余额扣。
+          注册、上报带的 app_key 必须是这里已启用的 App Key，否则返回 403。按次计费：每次上报按新增计次 × 单价从余额扣。
         </span>
         <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreating(true)}>
           生成 App Key
@@ -314,7 +325,7 @@ export default function AppKeys() {
         onCancel={() => setCreating(false)}
         destroyOnHidden
       >
-        <Form<CreateForm> form={createForm} layout="vertical" onFinish={create}>
+        <Form<CreateForm> form={createForm} layout="vertical" onFinish={create} initialValues={{ offline_runs: 5 }}>
           <Form.Item name="remark" label="备注" rules={[{ max: 255, message: '最多255个字' }]}>
             <Input placeholder="例如：阿福正式环境" />
           </Form.Item>
@@ -326,7 +337,7 @@ export default function AppKeys() {
           >
             <Input placeholder="留空自动生成" />
           </Form.Item>
-          <PriceFields />
+          <ConfigFields />
           <Form.Item name="initial_balance" label="初始余额" extra="会记一条充值流水；之后用「充值」追加。">
             <InputNumber {...yuanInput} placeholder="0" />
           </Form.Item>
@@ -334,23 +345,23 @@ export default function AppKeys() {
       </Modal>
 
       <Modal
-        title={`修改定价 ${pricing?.app_key ?? ''}`}
-        open={!!pricing}
+        title={`修改配置 ${editing?.app_key ?? ''}`}
+        open={!!editing}
         okText="保存"
         cancelText="取消"
         confirmLoading={saving}
-        onOk={() => priceForm.submit()}
-        onCancel={() => setPricing(undefined)}
+        onOk={() => configForm.submit()}
+        onCancel={() => setEditing(undefined)}
         destroyOnHidden
       >
         <Alert
           type="info"
           showIcon
           style={{ marginBottom: 16 }}
-          title="新单价从下一次上报开始生效；余额只能通过充值和扣费变化。"
+          title="新单价从下一次上报开始扣费；新的离线可用次数在下一次回复(ack / refused)里下发；余额只能通过充值和扣费变化。"
         />
-        <Form<PriceForm> form={priceForm} layout="vertical" onFinish={updatePrice}>
-          <PriceFields />
+        <Form<ConfigForm> form={configForm} layout="vertical" onFinish={updateConfig}>
+          <ConfigFields />
         </Form>
       </Modal>
 

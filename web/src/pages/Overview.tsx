@@ -20,9 +20,9 @@ export default function Overview() {
     { title: '安装总数', value: o?.installs_total },
     { title: '新增安装', value: o?.installs_new },
     { title: '上传次数', value: o?.reports },
-    { title: '测量次数', value: o?.measurements.count },
+    { title: '计次', value: o?.measurements.count },
     { title: '测量时长', value: o ? fmtDuration(o.measurements.dt_ms) : undefined },
-    { title: '短测量(≤5秒)', value: o?.measurements.short_count },
+    { title: '异常计次(≤5秒)', value: o?.measurements.short_count },
   ]
 
   return (

@@ -15,15 +15,39 @@
 
 ## 使用规则
 
-1. 客户端不能离线使用：检测(即一次测量)前由客户端自行校验网络，服务端不提供探活接口。
-2. 时长超过5秒(measurements[].dt_ms > 5000)的测量，无论是否中途退出，结束后都要立即上报并计费；5秒及以内的测量不上报、不计入counters。
-3. ack中的cap_frames / cap_runs只放行一次完整测量的用量；上一次测量的ack没收到之前cap不会增加，SDK的闸门会拦住下一次测量。
-4. 按次计费，额度按 App Key 计：内部后台给每个 App Key 定单价(元/次)、余额、透支额度；每次上报按「新增测量次数(counters.sessions 的增量) × 单价」从余额扣，余额可以扣到负数(透支)。余额加透支额度不够付下一次时，服务端在ack中返回cap = 已确认，不再放行；单价为0表示不收费。
-5. cap不够开始一次测量时，SDK先发一次report拿最新的cap：有未确认的上报就重发它，没有就发计数不变、measurements为空的空上报。服务端对空上报不扣费。
-6. 上报失败重试时seq和明文内容不变，只重新加密；服务端收到已处理过的seq，直接按当前状态重新返回ack，不重复扣费。
-7. 服务端换号：注册时install_id已存在(reason = conflict)，或上报时服务端没有该install_id(reason = unregistered)，服务端都会生成新的install_id并直接注册，返回refused：install_id字段就是新编号，其余字段和ack一样带上seq和cap。客户端收到后把这次请求视为服务端已收到，不再重发；替换成新编号，直接按refused中的cap继续使用，不需要发空上报；计数和seq接着用，不要再发register(会被再次换号)。
-8. 唯一性只看install_id；app_key、app_id同一个客户的所有客户端都相同，不参与判断。
-9. App Key 由我方在内部后台生成(或导入)并存库，发给客户；注册、上报带的 app_key 必须是已启用的 App Key，否则返回明文 403 invalid_app_key，数据不入库。
+### 计次
+
+1. 计费单位是「计次」：一次测量按 40 秒切成窗口(从窗口内第一帧被接受开始算)，窗口内测满 5 秒(> 5000 ms)计 1 次，不满或正好 5 秒不计。停止测量必须调用 reset 或 release，当前窗口随之结束。
+2. 5 秒和 40 秒都按 SDK 自己的单调时钟计算，不用帧时间戳，也不用设备时间。
+3. counters.sessions 是累计计次，服务端按「本次 − 已确认」的差额扣费；counters 里的其他计数只累计计了次的窗口。
+
+### 额度
+
+1. 可用次数 = acked_sessions + cap_runs − 本地累计计次 − 预留。每个窗口开始前先预留 1 次，不够就拦住(SDK 返回 -9)；已经开始的窗口能测满 40 秒，所以长测量跨窗口时也可能被拦。
+2. cap_runs 是「从 acked_sessions 往后还能新增几次」，即离线可用次数：跟 App Key 绑定，在内部后台配置(默认5，范围0~16)。设备不联网时最多先用这么多次，联网上报后按新增计次扣费。
+3. 第一次必须注册成功、拿到回复后才能使用，拿到回复前可用次数按0算。没注册就用掉的次数，服务端换号时会当作基线，不会扣费。
+4. 按次计费，额度按 App Key 计：内部后台给每个 App Key 定单价(元/次)、余额、透支额度；每次上报按「新增计次 × 单价」从余额扣，余额可以扣到负数(透支)。余额加透支额度不够付下一次时，回复的 cap_runs 为0；单价为0表示不收费。
+5. 已经放出去的次数不会收回：停发前设备手里的次数照常能用，联网补报时照常扣费，余额可能扣到透支额度以下。
+6. ttl_sec 为0或不带表示额度不限时；cap_frames、report_sec 可以不带，SDK 不用。
+
+### 上报
+
+1. 什么时候发：每计 1 次立刻发；测量结束时 counters 有变化再发一份(不计次、不扣费)；App 启动时有没确认的计次就补发。同一时间只有一份在途。联网状态由客户端自己判断，服务端不提供探活接口。
+2. 发什么：最新的累计 counters + 全部没确认的计次记录(no > acked_sessions)，最多16条。
+3. seq：
+   1. 30 秒没收到回复：内容没变就用原 seq 重发(明文不变，只重新加密)；有变化就换新 seq，合成一份。
+   2. 收到回复之后、或 App 重启之后再发：一律用新 seq，取 max(本地 seq, 回复的 seq) + 1。
+   3. 同一个 seq 只能对应一份内容，发出去之后不能再用于别的内容，重启后也一样。
+   4. 只想查最新额度(没有没确认的计次)：把最后一份原样重发，服务端按重复上报处理，不入库；还没上报过就发一份 seq = 1、计数为0、measurements 为空的空上报。
+4. 收到 ack / refused：本地累计取 max(本地, acked_sessions)，本地 seq 取 max(本地, 回复的 seq)，no ≤ acked_sessions 的计次记录视为已确认，可以删除；refused 先换成新的 install_id 再做这些。
+5. 失败重试：超时、断网、收到明文错误(4xx/5xx)，从30秒开始退避、每次翻倍，最长30分钟，网络恢复立刻重发。cap_runs 为0时按同样的节奏查询额度；宿主想开始测量被拦时立刻查一次(30秒内最多一次)。
+6. 服务端先落库再回复；seq ≤ 已确认seq 按重复处理，不入库、不扣费，按当前状态回复；所有回复都带 acked_sessions 和 cap_runs。
+
+### 换号和 App Key
+
+1. 服务端换号：注册时install_id已存在(reason = conflict)，或上报时服务端没有该install_id(reason = unregistered)，服务端都会生成新的install_id并直接注册，返回refused：install_id字段就是新编号，其余字段和ack一样带上seq、acked_sessions、cap_runs。客户端收到后把这次请求视为服务端已收到，不再重发；替换成新编号，直接按refused中的值继续使用；计数和seq接着用，不要再发register(会被再次换号)。
+2. 唯一性只看install_id；app_key、app_id同一个客户的所有客户端都相同，不参与判断。
+3. App Key 由我方在内部后台生成(或导入)并存库，发给客户；注册、上报带的 app_key 必须是已启用的 App Key，否则返回明文 403 invalid_app_key，数据不入库。
 
 ## 通用约定
 
@@ -96,7 +120,7 @@
 5. 服务端处理完成后，用**同一个aes密钥**和**新随机生成的iv**加密响应明文，按「响应ct结构」拼接后Base64编码得到ct。
 6. 客户端用本次请求的aes密钥解密响应；解密或tag校验失败的响应一律丢弃。
 
-> 响应必须换新iv：GCM下同一个密钥重复使用iv，会泄露两段明文的异或，还能反推出认证密钥并伪造密文，中间环节可以借此伪造ack、抬高cap_frames等上限。
+> 响应必须换新iv：GCM下同一个密钥重复使用iv，会泄露两段明文的异或，还能反推出认证密钥并伪造密文，中间环节可以借此伪造ack、抬高cap_runs等上限。
 
 #### 双端实现注意
 
@@ -179,7 +203,7 @@
 
 #### 过程描述
 
-根据结构体中的kid字段找到对应的rsa私钥，用这个私钥解密ek得到aes密钥，并对密文进行解密，得到明文json。解密失败等协议错误返回明文的http 400(见「错误响应」)。解密成功后，install_id不存在则注册相关的信息(入库)并返回ack；已存在则生成新的install_id直接注册，返回refused(reason = conflict)，install_id为新编号，并和ack一样带上seq和cap。响应使用同一个aes密钥和新随机生成的iv加密。详细步骤见「服务端处理流程」。
+根据结构体中的kid字段找到对应的rsa私钥，用这个私钥解密ek得到aes密钥，并对密文进行解密，得到明文json。解密失败等协议错误返回明文的http 400(见「错误响应」)。解密成功后，install_id不存在则注册相关的信息(入库)并返回ack；已存在则生成新的install_id直接注册，返回refused(reason = conflict)，install_id为新编号，并和ack一样带上seq、acked_sessions和cap_runs。响应使用同一个aes密钥和新随机生成的iv加密。详细步骤见「服务端处理流程」。
 
 #### 字段描述
 
@@ -193,16 +217,17 @@
 
 > 明文字段描述(报文类型为ack时)
 
-| 字段       | 说明                                                                                 | 样例                             |
-| ---------- | ------------------------------------------------------------------------------------ | -------------------------------- |
-| install_id | 安装编号                                                                             | ebedf529617fd42a433665cfd9150d46 |
-| seq        | 确认到第几份；回复注册时为 0                                                         | 1（回复注册时为 0）              |
-| cap_frames | 新的帧数上限 = 已确认的counters.frames_ok + 单次测量额度；额度用完时不加单次测量额度 | 300                              |
-| cap_runs   | 新的 run 上限 = 已确认的counters.run_ok + 单次测量额度；额度用完时不加单次测量额度   | 10                               |
-| ttl_sec    | 上限有效期（秒）                                                                     | 86400                            |
-| report_sec | 上报间隔（秒）                                                                       | 60                               |
+| 字段           | 说明                                                                                                                    | 样例                             |
+| -------------- | ----------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| install_id     | 安装编号                                                                                                                | ebedf529617fd42a433665cfd9150d46 |
+| seq            | 已确认的最大上报序号；回复注册时为 0                                                                                    | 1（回复注册时为 0）              |
+| acked_sessions | 服务端已确认的累计计次；回复注册时为 0                                                                                  | 1（回复注册时为 0）              |
+| cap_frames     | 帧数上限：固定为0，表示不按帧数拦截                                                                                     | 0                                |
+| cap_runs       | 从 acked_sessions 往后还能新增几次计次：取 App Key 配置的离线可用次数(默认5，范围0~16)；余额加透支额度不够付下一次时为0 | 5                                |
+| ttl_sec        | 额度有效期（秒），0 表示不限时                                                                                          | 0                                |
+| report_sec     | 上报间隔（秒），SDK 不用                                                                                                | 60                               |
 
-> 单次测量额度：一次完整测量最多用到的帧数 / run 次数，由服务端配置(上限由算法给出)
+> SDK 可用次数 = acked_sessions + cap_runs − 本地累计计次 − 预留，见「使用规则 / 额度」。
 
 明文样例(回复注册)：
 
@@ -210,25 +235,26 @@
 {
   "install_id": "ebedf529617fd42a433665cfd9150d46",
   "seq": 0,
-  "cap_frames": 300,
-  "cap_runs": 10,
-  "ttl_sec": 86400,
+  "acked_sessions": 0,
+  "cap_frames": 0,
+  "cap_runs": 5,
+  "ttl_sec": 0,
   "report_sec": 60
 }
 ```
 
 > 明文字段描述(报文类型为refused时；目前只在服务端换号时出现)
 
-| 字段                                           | 说明                                         | 样例                             |
-| ---------------------------------------------- | -------------------------------------------- | -------------------------------- |
-| install_id                                     | 安装编号：服务端新生成的编号，客户端直接替换 | 7c1e9a3b5d2f4e6a8b0c1d3e5f7a9b2c |
-| reason                                         | 拒绝原因，见下表                             | unregistered                     |
-| seq、cap_frames、cap_runs、ttl_sec、report_sec | 和ack完全相同；客户端直接按这里的cap继续使用 | 同ack                            |
+| 字段                                                           | 说明                                         | 样例                             |
+| -------------------------------------------------------------- | -------------------------------------------- | -------------------------------- |
+| install_id                                                     | 安装编号：服务端新生成的编号，客户端直接替换 | 7c1e9a3b5d2f4e6a8b0c1d3e5f7a9b2c |
+| reason                                                         | 拒绝原因，见下表                             | unregistered                     |
+| seq、acked_sessions、cap_frames、cap_runs、ttl_sec、report_sec | 和ack完全相同；客户端直接按这里的值继续使用  | 同ack                            |
 
-| reason       | 出现场景 | 含义                                             | SDK处理                                                                                              |
-| ------------ | -------- | ------------------------------------------------ | ---------------------------------------------------------------------------------------------------- |
-| conflict     | 注册     | install_id已被注册，服务端已生成新编号并直接注册 | 替换成refused中的install_id，按refused中的cap继续使用，不需要重新注册                                |
-| unregistered | 上报     | 服务端没有该编号，已生成新编号并直接注册         | 这份上报视为已收到、不再重发；替换成refused中的install_id，按refused中的cap继续使用，计数和seq接着用 |
+| reason       | 出现场景 | 含义                                                                     | SDK处理                                                                                                                   |
+| ------------ | -------- | ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| conflict     | 注册     | install_id已被注册，服务端已生成新编号并直接注册                         | 替换成refused中的install_id，按refused中的acked_sessions、cap_runs继续使用，不需要重新注册                                |
+| unregistered | 上报     | 服务端没有该编号，已生成新编号并直接注册，这份上报的计数作为基线(不扣费) | 这份上报视为已收到、不再重发；替换成refused中的install_id，按refused中的acked_sessions、cap_runs继续使用，计数和seq接着用 |
 
 明文样例(回复上报，服务端换号)：
 
@@ -237,9 +263,10 @@
   "install_id": "7c1e9a3b5d2f4e6a8b0c1d3e5f7a9b2c",
   "reason": "unregistered",
   "seq": 1,
-  "cap_frames": 600,
-  "cap_runs": 20,
-  "ttl_sec": 86400,
+  "acked_sessions": 1,
+  "cap_frames": 0,
+  "cap_runs": 5,
+  "ttl_sec": 0,
   "report_sec": 60
 }
 ```
@@ -248,7 +275,7 @@
 
 #### 过程描述
 
-客户端依旧和注册请求时一样，随机选择rsa公钥，并对再次生成的aes密钥进行加密(每一轮的对话都会使用新的aes密钥)，并和注册请求上传时一样对明文json进行加密，type为report，然后上传整体的结构体。上报时机见「使用规则」。
+客户端依旧和注册请求时一样，随机选择rsa公钥，并对再次生成的aes密钥进行加密(每一轮的对话都会使用新的aes密钥)，并和注册请求上传时一样对明文json进行加密，type为report，然后上传整体的结构体。上报时机、seq规则见「使用规则 / 上报」。
 
 #### 字段描述
 
@@ -256,30 +283,30 @@
 
 > 明文字段描述(ct解密后)
 
-| 字段                    | 说明                                                                         | 样例                             |
-| ----------------------- | ---------------------------------------------------------------------------- | -------------------------------- |
-| install_id              | 安装编号：SDK 随机生成                                                       | ebedf529617fd42a433665cfd9150d46 |
-| app_key                 | 同注册，必须是服务端已启用的 App Key；服务端没有该编号、需要自动注册时也用它 | AK-demo                          |
-| app_id                  | 同注册；用途同上                                                             | com.example.app                  |
-| platform                | 同注册；用途同上                                                             | android                          |
-| seq                     | 序号，每份加 1：去重、防重放、发现丢包；失败重试时不变                       | 1                                |
-| ts                      | 生成时间（Unix 毫秒）                                                        | 1792478748241                    |
-| sdk                     | sdk版本                                                                      | 1.1.0-beta.1                     |
-| counters.sessions       | 测量次数（累计）                                                             | 1                                |
-| counters.frames_ok      | 有效帧数（累计，计费）                                                       | 300                              |
-| counters.dt_ms          | 测量时长，毫秒（累计，计费）                                                 | 9966                             |
-| counters.mono_ms        | 同一时长按 SDK 时钟测（对照时间戳是否造假）                                  | 9968                             |
-| counters.run_ok         | run 次数（累计，计费）                                                       | 10                               |
-| counters.gated_frames   | 被闸门拒绝的帧数（累计）                                                     | 1                                |
-| counters.gated_runs     | 被闸门拒绝的 run 次数（累计）                                                | 0                                |
-| measurements            | 数组：本次上报的测量，正常 1 条；空上报时为空数组                            | [{…}]                            |
-| measurements[].no       | 单次编号：第几次测量（最后一条 = counters.sessions）                         | 1                                |
-| measurements[].start_ts | 单次开始测量时间：第一帧被接受（Unix 毫秒）                                  | 1792478738236                    |
-| measurements[].end_ts   | 单次结束测量时间：最后一帧被接受（Unix 毫秒）                                | 1792478748205                    |
-| measurements[].frames   | 这次测量的有效帧数                                                           | 300                              |
-| measurements[].dt_ms    | 这次测量的时长，毫秒（算法同 counters.dt_ms）                                | 9966                             |
+| 字段                    | 说明                                                                                                                          | 样例                             |
+| ----------------------- | ----------------------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| install_id              | 安装编号：SDK 随机生成                                                                                                        | ebedf529617fd42a433665cfd9150d46 |
+| app_key                 | 同注册，必须是服务端已启用的 App Key；服务端没有该编号、需要自动注册时也用它                                                  | AK-demo                          |
+| app_id                  | 同注册；用途同上                                                                                                              | com.example.app                  |
+| platform                | 同注册；用途同上                                                                                                              | android                          |
+| seq                     | 序号：去重、防重放；没收到回复的重试不变，其余每次发送取新号，见「使用规则 / 上报」                                           | 1                                |
+| ts                      | 生成时间（Unix 毫秒）                                                                                                         | 1792478743300                    |
+| sdk                     | sdk版本                                                                                                                       | 1.1.0-beta.1                     |
+| counters.sessions       | 累计计次（计费）                                                                                                              | 1                                |
+| counters.frames_ok      | 有效帧数（累计）                                                                                                              | 151                              |
+| counters.dt_ms          | 测量时长，毫秒（累计）                                                                                                        | 5005                             |
+| counters.mono_ms        | 同一时长按 SDK 时钟测（对照时间戳是否造假）                                                                                   | 5007                             |
+| counters.run_ok         | run 次数（累计）                                                                                                              | 5                                |
+| counters.gated_frames   | 被闸门拒绝的帧数（累计）                                                                                                      | 0                                |
+| counters.gated_runs     | 被闸门拒绝的 run 次数（累计）                                                                                                 | 0                                |
+| measurements            | 数组：全部没确认的计次记录(no > 上次回复的 acked_sessions)，最多16条；在线时正常 1 条，断网后补报时多条，没有新计次时为空数组 | [{…}]                            |
+| measurements[].no       | 第几次计次（最后一条 = counters.sessions）                                                                                    | 1                                |
+| measurements[].start_ts | 窗口开始：窗口内第一帧被接受（Unix 毫秒）                                                                                     | 1792478738236                    |
+| measurements[].end_ts   | 计次那一刻：窗口内测满5秒时被接受的那一帧（Unix 毫秒）                                                                        | 1792478743241                    |
+| measurements[].frames   | 窗口开始到计次那一刻的有效帧数                                                                                                | 151                              |
+| measurements[].dt_ms    | 窗口开始到计次那一刻的时长，毫秒（算法同 counters.dt_ms），大于5000                                                           | 5005                             |
 
-> counters中的sessions、frames_ok、dt_ms、mono_ms、run_ok只累计时长超过5秒的测量
+> counters 只累计计了次的窗口：计次那一刻先累计到当时，窗口结束、测量结束时再补上这个窗口剩下的部分(测量结束时补发一份上报)
 
 明文样例：
 
@@ -290,24 +317,24 @@
   "app_id": "com.example.app",
   "platform": "android",
   "seq": 1,
-  "ts": 1792478748241,
+  "ts": 1792478743300,
   "sdk": "1.1.0-beta.1",
   "counters": {
     "sessions": 1,
-    "frames_ok": 300,
-    "dt_ms": 9966,
-    "mono_ms": 9968,
-    "run_ok": 10,
-    "gated_frames": 1,
+    "frames_ok": 151,
+    "dt_ms": 5005,
+    "mono_ms": 5007,
+    "run_ok": 5,
+    "gated_frames": 0,
     "gated_runs": 0
   },
   "measurements": [
     {
       "no": 1,
       "start_ts": 1792478738236,
-      "end_ts": 1792478748205,
-      "frames": 300,
-      "dt_ms": 9966
+      "end_ts": 1792478743241,
+      "frames": 151,
+      "dt_ms": 5005
     }
   ]
 }
@@ -317,14 +344,14 @@
 
 #### 过程描述
 
-和之前的解密方式一样，提取密文并进行解密，解密失败等协议错误返回明文的http 400(见「错误响应」)。如果服务端没有该install_id的注册记录，生成新的install_id，用上报中的app_key、app_id、platform直接注册，以本次counters作为已确认基线，返回refused(reason = unregistered)，install_id为新编号，并和ack一样带上seq和cap。如果seq已经处理过(客户端重试)，直接按当前状态重新返回ack，不重复扣费。否则对相关的数据进行入库存储，计算相关的视频时长，进行相关的扣费逻辑(空上报计数不变，不扣费)，按「新增测量次数 × 单价」从 App Key 的余额扣费并记一条扣费流水；余额扣成负数(进入透支)、余额加透支额度不够付下一次(停发)时各发一次预警。然后根据 App Key 是否还够付下一次返回ack：够时cap = 已确认 + 单次测量额度，不够时cap = 已确认。详细步骤见「服务端处理流程」。
+和之前的解密方式一样，提取密文并进行解密，解密失败等协议错误返回明文的http 400(见「错误响应」)。如果服务端没有该install_id的注册记录，生成新的install_id，用上报中的app_key、app_id、platform直接注册，以本次counters作为已确认基线(不扣费)，返回refused(reason = unregistered)，install_id为新编号，并和ack一样带上seq、acked_sessions和cap_runs。如果seq已经处理过(客户端重试、查询额度)，直接按当前状态重新返回ack，不重复扣费。否则对相关的数据进行入库存储，按「新增计次 × 单价」从 App Key 的余额扣费并记一条扣费流水(计次没变的上报不扣费)；余额扣成负数(进入透支)、余额加透支额度不够付下一次(停发)时各发一次预警。然后返回ack：acked_sessions = 已确认的累计计次；App Key 还够付下一次时cap_runs = 这个 App Key 的离线可用次数，不够时cap_runs = 0；cap_frames固定为0。详细步骤见「服务端处理流程」。
 
 #### 字段描述
 
 外层字段与注册响应相同：
 
-1. type为ack时：明文字段和注册响应的ack完全相同，seq为已确认的最大上报序号。
-2. type为refused时：reason为unregistered，install_id为服务端新生成的编号，seq为本次上报的序号，明文字段和注册响应的refused相同。
+1. type为ack时：明文字段和注册响应的ack完全相同，seq为已确认的最大上报序号，acked_sessions为已确认的累计计次。
+2. type为refused时：reason为unregistered，install_id为服务端新生成的编号，seq为本次上报的序号，acked_sessions为本次上报的counters.sessions(基线)，明文字段和注册响应的refused相同。
 
 ## 服务端处理流程
 
@@ -338,36 +365,39 @@ sequenceDiagram
     participant S as 服务端
     participant DB as 存储
 
-    Note over SDK: 首次使用，SDK随机生成install_id
+    Note over SDK: 首次使用，SDK随机生成install_id，必须联网注册成功才能用
     SDK->>S: register
     alt install_id未注册
         S->>DB: 写入安装记录
-        S-->>SDK: ack(seq=0，cap=单次测量额度)
+        S-->>SDK: ack(seq=0，acked_sessions=0，cap_runs=离线可用次数)
     else install_id已注册
         S->>DB: 生成新编号并直接注册
-        S-->>SDK: refused(conflict，新编号，cap)
-        Note over SDK: 替换成新编号，按refused中的cap继续
+        S-->>SDK: refused(conflict，新编号，acked_sessions=0，cap_runs)
+        Note over SDK: 替换成新编号，按refused继续
     end
 
-    loop 每次测量
-        Note over SDK: 客户端自行校验网络
-        opt cap不够开始一次测量
-            SDK->>S: report(重发未确认的上报，或空上报)
-            S-->>SDK: ack(最新cap)
-        end
-        Note over SDK: 测量中，闸门按cap拦截
-        alt 测量超过5秒
-            SDK->>S: report(seq+1，累计counters，本次measurement)
+    loop 每个40秒窗口
+        Note over SDK: 可用 = acked_sessions + cap_runs − 本地累计 − 预留，不够返回-9
+        Note over SDK: 预留1次，窗口内测满5秒计1次
+        alt 能联网
+            SDK->>S: report(新seq，累计counters，全部没确认的计次)
             alt 服务端有该install_id
-                S->>DB: 入库、扣费、更新已确认状态
-                S-->>SDK: ack(新cap)
+                S->>DB: 入库、按新增计次扣费、更新已确认状态
+                S-->>SDK: ack(acked_sessions，cap_runs)
             else 服务端没有该install_id
-                S->>DB: 生成新编号并直接注册
-                S-->>SDK: refused(unregistered，新编号，cap)
-                Note over SDK: 这份上报视为已收到，替换成新编号，按refused中的cap继续
+                S->>DB: 生成新编号并直接注册，本次counters作为基线
+                S-->>SDK: refused(unregistered，新编号，acked_sessions，cap_runs)
+                Note over SDK: 这份上报视为已收到，替换成新编号继续
             end
-        else 5秒及以内
-            Note over SDK: 不上报，不计入counters
+        else 断网
+            Note over SDK: 计次留在本地，联网后一份上报补齐
+        end
+    end
+
+    opt cap_runs为0(余额不够)
+        loop 30秒起退避，每次翻倍，最长30分钟
+            SDK->>S: 原样重发最后一份上报
+            S-->>SDK: ack(当前的cap_runs，按重复上报处理)
         end
     end
 ```
@@ -397,11 +427,11 @@ sequenceDiagram
 1. 按install_id查安装记录，不存在：
    1. 校验app_id(规则随计费细则同步，先留桩放行)。
    2. 写入安装记录，已确认seq = 0，已确认counters全为0。install_id唯一，并发写入冲突时按「已存在」处理。
-   3. 按「cap计算」得到cap，返回ack(seq = 0)。
+   3. 按「回复字段计算」组装，返回ack(seq = 0，acked_sessions = 0)。
 2. 已存在(换号时不记录旧编号；refused丢失时客户端拿旧编号重试，会再换一次号，上一次换出的记录不再使用)：
    1. 生成新的install_id(32位小写hex随机数，与客户端生成的格式一致)。
    2. 写入安装记录：app_key、app_id、platform、sdk取自请求，reset = conflict，已确认seq = 0，已确认counters全为0。
-   3. 按「cap计算」得到cap，返回refused(reason = conflict，install_id = 新编号，seq = 0)。
+   3. 按「回复字段计算」组装，返回refused(reason = conflict，install_id = 新编号，seq = 0，acked_sessions = 0)。
 
 ### 上报处理
 
@@ -411,34 +441,35 @@ sequenceDiagram
    1. 校验app_id(规则随计费细则同步，先留桩放行)。
    2. 生成新的install_id(32位小写hex随机数，与客户端生成的格式一致)。
    3. 写入安装记录：app_key、app_id、platform、sdk取自本次上报，reset = unregistered，已确认seq = 本次seq，已确认counters = 本次counters(作为基线，历史用量不重复扣费)。
-   4. 保存本次上报和measurements；触发换号的这次测量是否计费随计费细则定(留桩)；如果计费，refused丢失重试再换号时会再扣一次。
-   5. 按「cap计算」得到cap，返回refused(reason = unregistered，install_id = 新编号，seq = 本次seq)。
+   4. 保存本次上报和measurements，本次增量记为0；这份上报带的计次是否计费随计费细则定(留桩，现在不扣)；如果计费，refused丢失重试再换号时会再扣一次。
+   5. 按「回复字段计算」组装，返回refused(reason = unregistered，install_id = 新编号，seq = 本次seq，acked_sessions = 本次counters.sessions)。
 3. 对这条安装记录加锁(行锁或分布式锁，随技术栈定)并重新读取，同一个install_id的上报串行处理；第5步的入库和更新在同一个事务里完成。
-4. seq ≤ 已确认seq：重复上报(客户端重试或乱序到达)，不入库、不扣费，直接到第6步。
+4. seq ≤ 已确认seq：重复上报(客户端重试、查询额度或乱序到达)，不入库、不扣费，直接到第6步。
 5. seq > 已确认seq：
-   1. 保存原始上报明文(install_id + seq唯一)，用于对账和审计。
-   2. 保存measurements(install_id + no唯一，重复的no忽略)。
-   3. 计算增量 = 本次counters - 已确认counters(每一项分别算)；空上报增量为0；某一项增量为负时该项按0处理并记录异常。
+   1. 计算增量 = 本次counters - 已确认counters(每一项分别算)；计数没变的上报增量为0；某一项增量为负时该项按0处理并记录异常；计次增量超过 cap_runs 时记录异常(SDK 被改过或有 bug)，照常扣费。
+   2. 保存原始上报明文和本次增量(install_id + seq唯一)，用于对账、审计和统计。
+   3. 保存measurements(install_id + no唯一，重复的no忽略)。
    4. 按本次请求的 App Key 扣费：锁住这个 App Key 的行(同一个 App Key 的扣费串行)，余额减去「counters.sessions 增量 × 单价」，累计计费次数加上增量，记一条扣费流水(install_id、seq、次数、单价、扣后余额)；增量为0不扣费。
    5. 更新安装记录：已确认seq = 本次seq；已确认counters每一项取max(已确认值, 本次值)，只增不减，避免计数变小后把已扣过的用量再扣一次。
    6. 提交事务；余额进入透支、停发额度时，在事务外异步发预警(目前只记日志，通知渠道待定)。
-6. 按「cap计算」得到cap，返回ack(seq = 已确认seq)。
+6. 按「回复字段计算」组装，返回ack(seq = 已确认seq，acked_sessions = 已确认的counters.sessions)。
 
-### cap计算
+### 回复字段计算
 
-1. App Key 还够付下一次(单价为0，或余额 + 透支额度 ≥ 单价)：cap_frames = 已确认counters.frames_ok + 单次测量额度，cap_runs = 已确认counters.run_ok + 单次测量额度。
-2. 不够付下一次：cap_frames = 已确认counters.frames_ok，cap_runs = 已确认counters.run_ok。
-3. ttl_sec、report_sec取配置值。
-4. 单次测量额度取配置；注册、重复上报、换号时也按这个 App Key 当前是否还有额度计算cap。其余计费规则随计费细则同步。
+1. acked_sessions：已确认的counters.sessions(只增不减)；注册时为0；上报换号时为本次上报的counters.sessions(基线)。
+2. cap_runs：App Key 还够付下一次(单价为0，或余额 + 透支额度 ≥ 单价)时取这个 App Key 的离线可用次数(内部后台配置，默认5，范围0~16)，否则为0(停发)。
+3. cap_frames固定为0，不按帧数拦截；ttl_sec、report_sec取配置值，ttl_sec 默认为0(不限时)。
+4. 注册、重复上报、换号时也按这个 App Key 当前是否还有额度、当前的离线可用次数计算；改了离线可用次数，从下一次回复开始生效。
+5. 停发只影响之后的回复：已经放出去的次数照常可以用完，联网补报时照常扣费，所以余额最多比透支额度再低「活跃设备数 × cap_runs × 单价」。其余计费规则随计费细则同步。
 
 ### 数据实体(逻辑模型)
 
-| 实体     | 主要字段                                                                                                 | 说明                                 |
-| -------- | -------------------------------------------------------------------------------------------------------- | ------------------------------------ |
-| rsa密钥  | kid、私钥、状态(启用 / 下线)                                                                             | 私钥放配置或密钥管理服务，不放业务库 |
-| 安装记录 | install_id(唯一)、app_key、app_id、platform、sdk、reset、注册时间、已确认seq、已确认counters、更新时间   | 每个install一条                      |
-| App Key  | app_key(唯一，区分大小写)、备注、状态(启用 / 停用)、单价、余额、透支额度、累计计费次数、创建人、创建时间 | 内部后台生成或导入                   |
-| 上报记录 | install_id + seq(唯一)、ts、原始明文json、接收时间                                                       | 对账、审计                           |
-| 测量记录 | install_id + no(唯一)、start_ts、end_ts、frames、dt_ms                                                   | 单次测量明细                         |
-| 计费流水 | App Key、类型(扣费 / 充值)、金额、变动后余额、次数、单价、install_id、seq、操作人、备注                  | 每笔扣费、充值一条                   |
-| 客户     | 随计费细则同步                                                                                           | 留桩                                 |
+| 实体     | 主要字段                                                                                                               | 说明                                 |
+| -------- | ---------------------------------------------------------------------------------------------------------------------- | ------------------------------------ |
+| rsa密钥  | kid、私钥、状态(启用 / 下线)                                                                                           | 私钥放配置或密钥管理服务，不放业务库 |
+| 安装记录 | install_id(唯一)、app_key、app_id、platform、sdk、reset、注册时间、已确认seq、已确认counters、更新时间                 | 每个install一条                      |
+| App Key  | app_key(唯一，区分大小写)、备注、状态(启用 / 停用)、单价、余额、透支额度、累计计费次数、离线可用次数、创建人、创建时间 | 内部后台生成或导入                   |
+| 上报记录 | install_id + seq(唯一)、ts、原始明文json、本次增量(计次、帧数、时长)、接收时间                                         | 对账、审计、统计                     |
+| 计次记录 | install_id + no(唯一)、start_ts、end_ts、frames、dt_ms                                                                 | 每次计次一条                         |
+| 计费流水 | App Key、类型(扣费 / 充值)、金额、变动后余额、次数、单价、install_id、seq、操作人、备注                                | 每笔扣费、充值一条                   |
+| 客户     | 随计费细则同步                                                                                                         | 留桩                                 |

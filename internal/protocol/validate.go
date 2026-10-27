@@ -6,7 +6,8 @@ import (
 	"fmt"
 )
 
-// MaxMeasurements 是单次上报measurements的防御性上限。
+// MaxMeasurements 是单次上报measurements的上限。一条 measurement 是一次没确认的计次，
+// 所以 App Key 的离线可用次数(cap_runs)不能超过它，否则离线攒下的计次一份上报装不下。
 const MaxMeasurements = 16
 
 // 字符串字段上限，与 migrations/001_init.sql 的列宽一致。

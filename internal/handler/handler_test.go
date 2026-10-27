@@ -132,7 +132,7 @@ func TestErrors(t *testing.T) {
 
 func TestSuccessResponseIsEncrypted(t *testing.T) {
 	k := key(t)
-	want := protocol.Ack{InstallID: installID, Seq: 0, CapFrames: 300, CapRuns: 10, TTLSec: 86400, ReportSec: 60}
+	want := protocol.Ack{InstallID: installID, Seq: 0, AckedSessions: 0, CapFrames: 0, CapRuns: 5, TTLSec: 0, ReportSec: 60}
 	r := newRouter(t, &fakeService{respType: protocol.TypeAck, resp: want})
 
 	ct, aesKey, err := envelope.SealRequest(&k.PublicKey, 1, 1, protocol.TypeRegister, registerPlain())
@@ -157,6 +157,11 @@ func TestSuccessResponseIsEncrypted(t *testing.T) {
 	json.Unmarshal(plain, &got)
 	if got != want {
 		t.Fatalf("got %+v", got)
+	}
+	var fields map[string]any // acked_sessions 是必填字段，为0也要带
+	json.Unmarshal(plain, &fields)
+	if _, ok := fields["acked_sessions"]; !ok {
+		t.Fatalf("回复缺 acked_sessions: %s", plain)
 	}
 }
 

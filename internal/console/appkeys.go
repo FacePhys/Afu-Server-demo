@@ -16,6 +16,7 @@ import (
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
 
+	"github.com/FacePhys/Afu-Server-demo/internal/protocol"
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
 )
 
@@ -27,6 +28,8 @@ const (
 	// 金额上限(0.0001元)，防止输错位数和溢出：单价不超过10万元/次，单笔充值、余额、透支额度不超过1亿元
 	maxUnitPrice = 100_000 * store.MoneyUnitsPerYuan
 	maxAmount    = 100_000_000 * store.MoneyUnitsPerYuan
+
+	maxOfflineRuns = protocol.MaxMeasurements // 离线可用次数上限：离线攒下的计次要能一份上报装下
 )
 
 // appKeyPattern 导入已有 App Key 时允许的格式，长度与 app_keys.app_key 列宽一致。
@@ -43,7 +46,8 @@ type AppKey struct {
 	UnitPrice      uint64    `json:"unit_price"`      // 单价/次，0为不收费
 	Balance        int64     `json:"balance"`         // 余额，透支时为负
 	OverdraftLimit uint64    `json:"overdraft_limit"` // 透支额度
-	UsedCount      uint64    `json:"used_count"`      // 累计计费测量次数
+	UsedCount      uint64    `json:"used_count"`      // 累计计费的计次
+	OfflineRuns    uint64    `json:"offline_runs"`    // 离线可用次数，ack 的 cap_runs 直接下发
 	BillingState   string    `json:"billing_state"`   // free / normal / overdraft / exhausted
 	CreatedBy      string    `json:"created_by"`
 	CreatedAt      time.Time `json:"created_at"`
@@ -72,7 +76,7 @@ type LedgerEntry struct {
 func toAppKey(k store.AppKey) AppKey {
 	return AppKey{ID: k.ID, AppKey: k.AppKey, Remark: k.Remark, Status: k.Status,
 		UnitPrice: k.UnitPrice, Balance: k.Balance, OverdraftLimit: k.OverdraftLimit, UsedCount: k.UsedCount,
-		BillingState: k.BillingState(), CreatedBy: k.CreatedBy, CreatedAt: k.CreatedAt.UTC(), UpdatedAt: k.UpdatedAt.UTC()}
+		OfflineRuns: k.OfflineRuns, BillingState: k.BillingState(), CreatedBy: k.CreatedBy, CreatedAt: k.CreatedAt.UTC(), UpdatedAt: k.UpdatedAt.UTC()}
 }
 
 func toLedgerEntry(e store.LedgerEntry) LedgerEntry {
@@ -128,15 +132,20 @@ func (s *Server) handleAppKeys(c *gin.Context) {
 // 可同时设置单价、初始余额、透支额度；初始余额记一条充值流水。
 func (s *Server) handleCreateAppKey(c *gin.Context) {
 	var req struct {
-		Remark         string `json:"remark"`
-		AppKey         string `json:"app_key"`         // 可选
-		UnitPrice      uint64 `json:"unit_price"`      // 可选，0为不收费
-		InitialBalance uint64 `json:"initial_balance"` // 可选
-		OverdraftLimit uint64 `json:"overdraft_limit"` // 可选
+		Remark         string  `json:"remark"`
+		AppKey         string  `json:"app_key"`         // 可选
+		UnitPrice      uint64  `json:"unit_price"`      // 可选，0为不收费
+		InitialBalance uint64  `json:"initial_balance"` // 可选
+		OverdraftLimit uint64  `json:"overdraft_limit"` // 可选
+		OfflineRuns    *uint64 `json:"offline_runs"`    // 可选，不传默认5
 	}
 	if err := decodeBody(c, &req); err != nil {
 		s.failErr(c, err)
 		return
+	}
+	offlineRuns := uint64(store.DefaultOfflineRuns)
+	if req.OfflineRuns != nil {
+		offlineRuns = *req.OfflineRuns
 	}
 	key := strings.TrimSpace(req.AppKey)
 	if key == "" {
@@ -146,7 +155,8 @@ func (s *Server) handleCreateAppKey(c *gin.Context) {
 		return
 	}
 	remark := strings.TrimSpace(req.Remark)
-	if !validRemark(remark) || req.UnitPrice > maxUnitPrice || req.InitialBalance > maxAmount || req.OverdraftLimit > maxAmount {
+	if !validRemark(remark) || req.UnitPrice > maxUnitPrice || req.InitialBalance > maxAmount || req.OverdraftLimit > maxAmount ||
+		offlineRuns > maxOfflineRuns {
 		fail(c, errBadRequest)
 		return
 	}
@@ -154,7 +164,7 @@ func (s *Server) handleCreateAppKey(c *gin.Context) {
 	db, cancel := s.query(c)
 	defer cancel()
 	row := store.AppKey{AppKey: key, Remark: remark, Status: store.AppKeyEnabled, UnitPrice: req.UnitPrice,
-		Balance: int64(req.InitialBalance), OverdraftLimit: req.OverdraftLimit, CreatedBy: user(c)}
+		Balance: int64(req.InitialBalance), OverdraftLimit: req.OverdraftLimit, OfflineRuns: offlineRuns, CreatedBy: user(c)}
 	err := db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&row).Error; err != nil {
 			return err
@@ -177,11 +187,12 @@ func (s *Server) handleCreateAppKey(c *gin.Context) {
 		return
 	}
 	s.log.Info("app_key created", "user", user(c), "id", row.ID, "app_key", row.AppKey, "imported", req.AppKey != "",
-		"unit_price", row.UnitPrice, "initial_balance", req.InitialBalance, "overdraft_limit", row.OverdraftLimit)
+		"unit_price", row.UnitPrice, "initial_balance", req.InitialBalance, "overdraft_limit", row.OverdraftLimit,
+		"offline_runs", row.OfflineRuns)
 	c.JSON(http.StatusCreated, toAppKey(row))
 }
 
-// handleUpdateAppKey 修改状态(启用 / 停用)、备注、单价、透支额度；不提供删除，停用即可。
+// handleUpdateAppKey 修改状态(启用 / 停用)、备注、单价、透支额度、离线可用次数；不提供删除，停用即可。
 // 余额只能通过充值和上报扣费变化，保证和流水对得上。
 func (s *Server) handleUpdateAppKey(c *gin.Context) {
 	id, ok := appKeyID(c)
@@ -194,6 +205,7 @@ func (s *Server) handleUpdateAppKey(c *gin.Context) {
 		Remark         *string `json:"remark"`
 		UnitPrice      *uint64 `json:"unit_price"`
 		OverdraftLimit *uint64 `json:"overdraft_limit"`
+		OfflineRuns    *uint64 `json:"offline_runs"`
 	}
 	if err := decodeBody(c, &req); err != nil {
 		s.failErr(c, err)
@@ -229,6 +241,13 @@ func (s *Server) handleUpdateAppKey(c *gin.Context) {
 		}
 		updates["overdraft_limit"] = *req.OverdraftLimit
 	}
+	if req.OfflineRuns != nil {
+		if *req.OfflineRuns > maxOfflineRuns {
+			fail(c, errBadRequest)
+			return
+		}
+		updates["offline_runs"] = *req.OfflineRuns
+	}
 	if len(updates) == 0 {
 		fail(c, errBadRequest)
 		return
@@ -250,7 +269,7 @@ func (s *Server) handleUpdateAppKey(c *gin.Context) {
 		return
 	}
 	s.log.Info("app_key updated", "user", user(c), "id", id, "app_key", row.AppKey, "status", row.Status,
-		"unit_price", row.UnitPrice, "overdraft_limit", row.OverdraftLimit)
+		"unit_price", row.UnitPrice, "overdraft_limit", row.OverdraftLimit, "offline_runs", row.OfflineRuns)
 	c.JSON(http.StatusOK, toAppKey(row))
 }
 

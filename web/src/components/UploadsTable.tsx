@@ -19,7 +19,7 @@ function ClientTime({ ms }: { ms: number }) {
   )
 }
 
-/** 本次上报带的测量：每条一行，悬停看客户端起止时间；空上报标灰 */
+/** 本次上报带的计次记录：每条一行，悬停看客户端起止时间；空上报标灰 */
 function ReportedMeasurements({ items }: { items: ReportedMeasurement[] }) {
   if (!items.length) return <Tag>空上报</Tag>
   return (
@@ -47,7 +47,7 @@ function ReportDrawer({ id, onClose }: { id: number; onClose: () => void }) {
   )
 }
 
-/** 上传记录表格：每行一次上传(本次测量 + 累计计数)；filters 变化时由父组件换 key */
+/** 上传记录表格：每行一次上传(本次计次 + 累计计数)；filters 变化时由父组件换 key */
 export default function UploadsTable({ filters, showInstall = true }: { filters: Params; showInstall?: boolean }) {
   const [openId, setOpenId] = useState<number>()
   const columns: TableColumnsType<Report> = [
@@ -57,9 +57,9 @@ export default function UploadsTable({ filters, showInstall = true }: { filters:
     { title: 'seq', dataIndex: 'seq' },
     { title: '客户端时间', dataIndex: 'client_ts', render: (v: number) => <ClientTime ms={v} /> },
     { title: '服务端收到时间', dataIndex: 'received_at', render: fmtTime },
-    { title: '本次测量', key: 'measurements', render: (_, r) => <ReportedMeasurements items={r.measurements} /> },
+    { title: '本次计次', key: 'measurements', render: (_, r) => <ReportedMeasurements items={r.measurements} /> },
     { title: '本次扣费(元)', dataIndex: 'charge', align: 'right', render: (v: number) => (v ? fmtYuan(v) : '-') },
-    { title: '累计测量次数', key: 'sessions', align: 'right', render: (_, r) => fmtNum(r.counters.sessions) },
+    { title: '累计计次', key: 'sessions', align: 'right', render: (_, r) => fmtNum(r.counters.sessions) },
     { title: '累计有效帧数', key: 'frames_ok', align: 'right', render: (_, r) => fmtNum(r.counters.frames_ok) },
     {
       title: '累计时长',

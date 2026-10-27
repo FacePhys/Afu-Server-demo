@@ -71,9 +71,12 @@ func seed(t *testing.T, db *gorm.DB) {
 	}
 	reports := []store.Report{
 		{InstallID: idA, Seq: 1, ClientTS: 1, ReceivedAt: utc("2026-10-26T02:00:00Z"),
-			Payload: `{"seq":1,"counters":{"sessions":1,"frames_ok":300,"run_ok":10},"measurements":[{"no":1,"start_ts":10,"end_ts":20,"frames":300,"dt_ms":9966}]}`},
-		{InstallID: idA, Seq: 2, ClientTS: 2, Payload: `{"seq":2}`, ReceivedAt: utc("2026-10-26T03:00:00Z")},
-		{InstallID: idC, Seq: 5, ClientTS: 5, Payload: `{"seq":5}`, ReceivedAt: utc("2026-10-24T10:00:00Z")},
+			Payload:       `{"seq":1,"counters":{"sessions":1,"frames_ok":300,"run_ok":10},"measurements":[{"no":1,"start_ts":10,"end_ts":20,"frames":300,"dt_ms":9966}]}`,
+			DeltaSessions: 1, DeltaFrames: 300, DeltaDtMs: 9966},
+		{InstallID: idA, Seq: 2, ClientTS: 2, Payload: `{"seq":2}`, ReceivedAt: utc("2026-10-26T03:00:00Z"),
+			DeltaSessions: 1, DeltaFrames: 150, DeltaDtMs: 4000},
+		{InstallID: idC, Seq: 5, ClientTS: 5, Payload: `{"seq":5}`, ReceivedAt: utc("2026-10-24T10:00:00Z"),
+			DeltaSessions: 1, DeltaFrames: 300, DeltaDtMs: 9000},
 	}
 	measurements := []store.Measurement{
 		{InstallID: idA, MeasureNo: 1, Seq: 1, StartTS: 10, EndTS: 20, Frames: 300, DtMs: 9966, CreatedAt: utc("2026-10-26T02:00:00Z")},
@@ -311,8 +314,8 @@ func TestIntegrationAppKeys(t *testing.T) {
 		priced.BillingState != "normal" {
 		t.Fatalf("创建: %d %s", w.Code, w.Body)
 	}
-	if gen.BillingState != "free" {
-		t.Fatalf("默认不收费: %+v", gen)
+	if gen.BillingState != "free" || gen.OfflineRuns != 5 {
+		t.Fatalf("默认不收费、离线次数10: %+v", gen)
 	}
 
 	// 余额为负但加上透支额度还够付一次：透支中；不够付一次：已停发；充值后恢复
@@ -343,6 +346,25 @@ func TestIntegrationAppKeys(t *testing.T) {
 	if len(ledger.Items) != 2 || ledger.Items[0].Remark != "续费" || ledger.Items[0].Amount != 20000 ||
 		ledger.Items[0].Operator != "alice" || ledger.Items[1].Remark != "初始余额" || ledger.Items[1].BalanceAfter != 10000 {
 		t.Fatalf("流水 = %+v", ledger.Items)
+	}
+
+	// 离线可用次数：创建时指定、之后修改，范围0~16
+	w = send(t, h, http.MethodPost, base, `{"remark":"离线","offline_runs":3}`)
+	var offline AppKey
+	json.Unmarshal(w.Body.Bytes(), &offline)
+	if w.Code != http.StatusCreated || offline.OfflineRuns != 3 {
+		t.Fatalf("创建离线次数: %d %s", w.Code, w.Body)
+	}
+	w = send(t, h, http.MethodPatch, base+"/"+itoa(offline.ID), `{"offline_runs":0}`)
+	json.Unmarshal(w.Body.Bytes(), &upd)
+	if w.Code != http.StatusOK || upd.OfflineRuns != 0 {
+		t.Fatalf("改离线次数: %d %s", w.Code, w.Body)
+	}
+	if w = send(t, h, http.MethodPatch, base+"/"+itoa(offline.ID), `{"offline_runs":16}`); w.Code != http.StatusOK {
+		t.Fatalf("离线次数改成上限16: %d %s", w.Code, w.Body)
+	}
+	if w = send(t, h, http.MethodPatch, base+"/"+itoa(offline.ID), `{"offline_runs":17}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("离线次数超过16应拒绝: %d %s", w.Code, w.Body)
 	}
 }
 

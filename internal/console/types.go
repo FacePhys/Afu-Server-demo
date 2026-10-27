@@ -18,12 +18,10 @@ type Me struct {
 }
 
 type Meta struct {
-	PerMeasureFrames uint64 `json:"per_measure_frames"`
-	PerMeasureRuns   uint64 `json:"per_measure_runs"`
-	TTLSec           int    `json:"ttl_sec"`
-	ReportSec        int    `json:"report_sec"`
-	ActiveKids       []int  `json:"active_kids"`
-	Version          string `json:"version"`
+	TTLSec     int    `json:"ttl_sec"`
+	ReportSec  int    `json:"report_sec"`
+	ActiveKids []int  `json:"active_kids"`
+	Version    string `json:"version"`
 }
 
 type Overview struct {
@@ -40,11 +38,12 @@ type Reassigned struct {
 	Unregistered int64 `json:"unregistered"`
 }
 
+// MeasurementSummary 计次、帧数、时长是区间内上报的增量合计；ShortCount 是 dt_ms ≤ 5000 的计次记录(SDK 不该发，算异常)。
 type MeasurementSummary struct {
 	Count      int64  `json:"count"`
 	Frames     uint64 `json:"frames"`
 	DtMs       uint64 `json:"dt_ms"`
-	ShortCount int64  `json:"short_count"` // dt_ms ≤ 5000
+	ShortCount int64  `json:"short_count"`
 }
 
 type PlatformCount struct {
@@ -60,7 +59,7 @@ type DayStat struct {
 	Date         string `json:"date"` // 北京时间 YYYY-MM-DD
 	NewInstalls  int64  `json:"new_installs"`
 	Reports      int64  `json:"reports"`
-	Measurements int64  `json:"measurements"`
+	Measurements int64  `json:"measurements"` // 计次：当天上报的新增计次合计
 	Frames       uint64 `json:"frames"`
 	DtMs         uint64 `json:"dt_ms"`
 }
@@ -84,7 +83,7 @@ type Report struct {
 	ClientTS     int64                  `json:"client_ts"`
 	ReceivedAt   time.Time              `json:"received_at"`
 	Counters     protocol.Counters      `json:"counters"`          // 从明文解析，累计值
-	Measurements []protocol.Measurement `json:"measurements"`      // 从明文解析，本次上报带的测量；空上报为[]
+	Measurements []protocol.Measurement `json:"measurements"`      // 从明文解析，本次上报带的计次记录；空上报为[]
 	Charge       int64                  `json:"charge"`            // 本次上报扣的钱，0.0001元；没扣费为0
 	Payload      json.RawMessage        `json:"payload,omitempty"` // 原始明文，只有详情接口返回
 }

@@ -9,8 +9,8 @@ import (
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
 )
 
-// KeyBilling 按次计费：每次上报按「新增测量次数 × 单价」从 App Key 的余额扣，每笔扣费记一条流水。
-// 余额加透支额度不够付下一次时停发额度(ack 的 cap 等于已确认值)；进入透支、停发时各发一次预警。
+// KeyBilling 按次计费：每次上报按「新增计次 × 单价」从 App Key 的余额扣，每笔扣费记一条流水。
+// 余额加透支额度不够付下一次时停发额度(ack / refused 的 cap_runs 为0)；进入透支、停发时各发一次预警。
 // 单价为0的 Key 不扣钱，但照常累计次数、记流水。
 type KeyBilling struct {
 	Noop

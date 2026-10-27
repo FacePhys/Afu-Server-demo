@@ -22,7 +22,7 @@ function DayColumn({ data }: { data: Point[] }) {
   )
 }
 
-// DailyCharts 按天的测量次数和测量时长(分钟)，两张图并排。
+// DailyCharts 按天的计次和测量时长(分钟)，两张图并排；按上报的增量合计，按收到的日期算。
 export default function DailyCharts({ days, loading }: { days: DayStat[] | undefined; loading: boolean }) {
   const label = (d: DayStat) => d.date.slice(5)
   const counts = (days ?? []).map((d) => ({ date: label(d), value: d.measurements }))
@@ -31,7 +31,7 @@ export default function DailyCharts({ days, loading }: { days: DayStat[] | undef
   return (
     <Row gutter={[16, 16]}>
       <Col xs={24} lg={12}>
-        <Card title="测量次数(按天)" loading={loading}>
+        <Card title="计次(按天)" loading={loading}>
           <DayColumn data={counts} />
         </Card>
       </Col>

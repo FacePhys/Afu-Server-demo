@@ -12,7 +12,7 @@ interface FilterForm {
   short_only?: boolean
 }
 
-// Uploads 上传记录：每行一次上传，本次测量和累计计数直接展示。
+// Uploads 上传记录：每行一次上传，本次计次和累计计数直接展示。
 export default function Uploads() {
   const [filters, setFilters] = useState<Params>({})
 
@@ -33,7 +33,7 @@ export default function Uploads() {
           <DatePicker.RangePicker showTime placeholder={['收到时间起', '收到时间止']} />
         </Form.Item>
         <Form.Item name="short_only" valuePropName="checked">
-          <Checkbox>只看含5秒及以内测量的</Checkbox>
+          <Checkbox>只看含5秒及以内计次的</Checkbox>
         </Form.Item>
         <Button type="primary" htmlType="submit">
           查询

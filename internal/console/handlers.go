@@ -14,7 +14,7 @@ import (
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
 )
 
-// shortDtMs 及以下算「短测量」，见 readme.md「使用规则」第2条。
+// shortDtMs 及以下的计次记录算异常：窗口内测满5秒(不含)才计次，见 readme.md「使用规则 / 计次」第1条。
 const shortDtMs = 5000
 
 // resetReasons 是 reset_reason 筛选值到库里取值的映射；first 表示首次安装(库里为空字符串)。
@@ -52,11 +52,11 @@ func (s *Server) handleOverview(c *gin.Context) {
 		Reason string `gorm:"column:reset_reason"`
 		N      int64  `gorm:"column:n"`
 	}
-	var ms struct {
-		Count      int64  `gorm:"column:count"`
-		Frames     uint64 `gorm:"column:frames"`
-		DtMs       uint64 `gorm:"column:dt_ms"`
-		ShortCount int64  `gorm:"column:short_count"`
+	var rs struct { // 上报数和增量合计
+		Reports int64  `gorm:"column:reports"`
+		Count   int64  `gorm:"column:count"`
+		Frames  uint64 `gorm:"column:frames"`
+		DtMs    uint64 `gorm:"column:dt_ms"`
 	}
 	var platforms []struct {
 		Platform string `gorm:"column:platform"`
@@ -69,11 +69,12 @@ func (s *Server) handleOverview(c *gin.Context) {
 		db.Model(&store.Install{}).Select("reset_reason, COUNT(*) AS n").Where(inRange, from, to).
 			Where("reset_reason IN ?", []string{protocol.ReasonConflict, protocol.ReasonUnregistered}).
 			Group("reset_reason").Scan(&reassigned).Error,
-		db.Model(&store.Report{}).Where("received_at >= ? AND received_at < ?", from, to).Count(&o.Reports).Error,
-		db.Model(&store.Measurement{}).
-			Select("COUNT(*) AS count, COALESCE(SUM(frames), 0) AS frames, COALESCE(SUM(dt_ms), 0) AS dt_ms, "+
-				"COALESCE(SUM(dt_ms <= ?), 0) AS short_count", shortDtMs).
-			Where(inRange, from, to).Scan(&ms).Error,
+		db.Model(&store.Report{}).
+			Select("COUNT(*) AS reports, COALESCE(SUM(delta_sessions), 0) AS count, "+
+				"COALESCE(SUM(delta_frames), 0) AS frames, COALESCE(SUM(delta_dt_ms), 0) AS dt_ms").
+			Where("received_at >= ? AND received_at < ?", from, to).Scan(&rs).Error,
+		db.Model(&store.Measurement{}).Where(inRange, from, to).Where("dt_ms <= ?", shortDtMs).
+			Count(&o.Measurements.ShortCount).Error,
 		db.Model(&store.Install{}).Select("platform, COUNT(*) AS installs").Group("platform").
 			Order("installs DESC").Scan(&platforms).Error,
 	)
@@ -89,7 +90,8 @@ func (s *Server) handleOverview(c *gin.Context) {
 			o.Reassigned.Unregistered = r.N
 		}
 	}
-	o.Measurements = MeasurementSummary(ms)
+	o.Reports = rs.Reports
+	o.Measurements.Count, o.Measurements.Frames, o.Measurements.DtMs = rs.Count, rs.Frames, rs.DtMs
 	o.ByPlatform = make([]PlatformCount, 0, len(platforms))
 	for _, p := range platforms {
 		o.ByPlatform = append(o.ByPlatform, PlatformCount(p))
@@ -112,24 +114,24 @@ func (s *Server) handleDaily(c *gin.Context) {
 	defer cancel()
 
 	type dayRow struct {
-		D      string `gorm:"column:d"`
-		N      int64  `gorm:"column:n"`
-		Frames uint64 `gorm:"column:frames"`
-		DtMs   uint64 `gorm:"column:dt_ms"`
+		D        string `gorm:"column:d"`
+		N        int64  `gorm:"column:n"`
+		Sessions int64  `gorm:"column:sessions"`
+		Frames   uint64 `gorm:"column:frames"`
+		DtMs     uint64 `gorm:"column:dt_ms"`
 	}
-	var installs, reports, measurements []dayRow
+	var installs, reports []dayRow
 
 	qi := db.Model(&store.Install{}).Select(dayExpr("created_at")+" AS d, COUNT(*) AS n").
 		Where("created_at >= ? AND created_at < ?", from, to)
-	qr := db.Table("reports AS r").Select(dayExpr("r.received_at")+" AS d, COUNT(*) AS n").
-		Where("r.received_at >= ? AND r.received_at < ?", from, to)
-	qm := db.Table("measurements AS m").
-		Select(dayExpr("m.created_at")+" AS d, COUNT(*) AS n, COALESCE(SUM(m.frames), 0) AS frames, COALESCE(SUM(m.dt_ms), 0) AS dt_ms").
-		Where("m.created_at >= ? AND m.created_at < ?", from, to)
+	// 计次、帧数、时长按每份上报的增量求和，按收到的日期算
+	qr := db.Model(&store.Report{}).
+		Select(dayExpr("received_at")+" AS d, COUNT(*) AS n, COALESCE(SUM(delta_sessions), 0) AS sessions, "+
+			"COALESCE(SUM(delta_frames), 0) AS frames, COALESCE(SUM(delta_dt_ms), 0) AS dt_ms").
+		Where("received_at >= ? AND received_at < ?", from, to)
 	err = firstErr(
 		qi.Group("d").Scan(&installs).Error,
 		qr.Group("d").Scan(&reports).Error,
-		qm.Group("d").Scan(&measurements).Error,
 	)
 	if err != nil {
 		s.failErr(c, err)
@@ -154,11 +156,8 @@ func (s *Server) handleDaily(c *gin.Context) {
 		day(r.D).NewInstalls = r.N
 	}
 	for _, r := range reports {
-		day(r.D).Reports = r.N
-	}
-	for _, r := range measurements {
 		d := day(r.D)
-		d.Measurements, d.Frames, d.DtMs = r.N, r.Frames, r.DtMs
+		d.Reports, d.Measurements, d.Frames, d.DtMs = r.N, r.Sessions, r.Frames, r.DtMs
 	}
 	c.JSON(http.StatusOK, out)
 }

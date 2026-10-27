@@ -15,7 +15,7 @@ type ChargeRequest struct {
 	AppKey    string            // 这次请求带的 App Key
 	InstallID string            // 用于流水
 	Seq       uint64            // 用于流水
-	Delta     protocol.Counters // 本次计数增量，按 Delta.Sessions(新增测量次数)计费
+	Delta     protocol.Counters // 本次计数增量，按 Delta.Sessions(新增计次)计费
 }
 
 type ChargeResult struct {
