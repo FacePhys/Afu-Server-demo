@@ -11,6 +11,7 @@ import (
 	"github.com/FacePhys/Afu-Server-demo/internal/billing"
 	"github.com/FacePhys/Afu-Server-demo/internal/protocol"
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
+	"github.com/FacePhys/Afu-Server-demo/internal/violation"
 )
 
 // minBilledDtMs 窗口内测满这么久(不含)才计次，见 readme.md「使用规则 / 计次」第1条；一条 measurement 是一次计次，不该小于等于它。
@@ -25,6 +26,8 @@ type reportResult struct {
 	appKey    string
 	needQuota bool // 重复上报、换号：事务提交后再查额度
 	charge    billing.ChargeResult
+	bad       []protocol.Measurement // 这份上报新出现的违规计次记录(start_ts > end_ts)
+	violation *violation.State       // 有新违规时，事务里累计后的状态
 }
 
 // Report 处理上报：一个事务完成，按install_id加行锁串行处理。
@@ -67,10 +70,17 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 			s.log.Warn("sessions delta exceeds cap_runs", "install_id", inst.InstallID, "seq", req.Seq,
 				"delta", delta.Sessions, "cap_runs", key.OfflineRuns)
 		}
+		bad, err := violation.Detect(tx, inst.InstallID, req.Measurements) // 要在保存 measurements 之前
+		if err != nil {
+			return err
+		}
 		if err := saveReport(tx, inst.InstallID, req, raw, delta); err != nil {
 			return err
 		}
-		charge, err := s.billing.Charge(ctx, tx, billing.ChargeRequest{ // 按新增计次扣费、判断额度
+		if err := recordViolations(tx, inst.InstallID, req.Seq, bad, &res); err != nil { // 要在扣费(锁 App Key)之前
+			return err
+		}
+		charge, err := s.billing.Charge(ctx, tx, billing.ChargeRequest{ // 按新增计次扣费(违规的计次照常扣)、判断额度
 			AppKey: req.AppKey, InstallID: inst.InstallID, Seq: req.Seq, Delta: delta})
 		if err != nil {
 			return err
@@ -97,11 +107,49 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 	if res.charge.Warn { // 预警通知放在事务外异步发送
 		go s.notifier.QuotaWarning(context.WithoutCancel(ctx), res.appKey)
 	}
-
-	if res.respType == protocol.TypeRefused {
-		return protocol.TypeRefused, s.refused(res.installID, res.seq, res.acked, key, hasQuota, res.reason), nil
+	violations, err := s.violationCount(ctx, key, req.Seq, &res)
+	if err != nil {
+		return "", nil, err
 	}
-	return protocol.TypeAck, s.ack(res.installID, res.seq, res.acked, key, hasQuota), nil
+
+	caps := capRuns(key, hasQuota, violations)
+	if res.respType == protocol.TypeRefused {
+		return protocol.TypeRefused, s.refused(res.installID, res.seq, res.acked, caps, res.reason), nil
+	}
+	return protocol.TypeAck, s.ack(res.installID, res.seq, res.acked, caps), nil
+}
+
+// recordViolations 累计这份上报新出现的违规。调用方已锁住安装记录；要在扣费(锁 App Key)之前调用，保持加锁顺序。
+func recordViolations(tx *gorm.DB, installID string, seq uint64, bad []protocol.Measurement, res *reportResult) error {
+	if len(bad) == 0 {
+		return nil
+	}
+	st, err := violation.Record(tx, installID, seq, bad)
+	if err != nil {
+		return err
+	}
+	res.bad, res.violation = bad, &st
+	return nil
+}
+
+// violationCount 设备当前的违规次数，事务提交后调用。这份上报新增了违规时用事务里的值(不看缓存)，写缓存、记日志；
+// 否则查缓存，缓存不能用时查库。App Key 不限违规次数时不用查。
+func (s *Service) violationCount(ctx context.Context, key store.AppKey, seq uint64, res *reportResult) (uint64, error) {
+	if st := res.violation; st != nil {
+		s.violations.Publish(ctx, *st)
+		last := res.bad[len(res.bad)-1]
+		s.log.Warn("measurement start_ts after end_ts", "install_id", st.InstallID, "seq", seq, "new", len(res.bad),
+			"no", last.No, "start_ts", last.StartTS, "end_ts", last.EndTS, "violations", st.Count, "max_violations", key.MaxViolations)
+		if key.ViolationLimitReached(st.Count) && !key.ViolationLimitReached(st.Count-uint64(len(res.bad))) {
+			s.log.Warn("violation limit reached, cap_runs stopped", "install_id", st.InstallID,
+				"violations", st.Count, "max_violations", key.MaxViolations)
+		}
+		return st.Count, nil
+	}
+	if key.MaxViolations == 0 {
+		return 0, nil
+	}
+	return s.violations.Count(ctx, res.installID)
 }
 
 // reassignOnReport 服务端没有该install_id：生成新编号直接注册，以本次counters为基线，返回refused(unregistered)。
@@ -116,7 +164,15 @@ func (s *Service) reassignOnReport(ctx context.Context, tx *gorm.DB, req protoco
 	if err := s.createWithNewID(tx, &inst); err != nil {
 		return err
 	}
+	bad, err := violation.Detect(tx, inst.InstallID, req.Measurements) // 新编号，带的违规计次都算
+	if err != nil {
+		return err
+	}
 	if err := saveReport(tx, inst.InstallID, req, raw, protocol.Counters{}); err != nil { // 基线，增量为0
+		return err
+	}
+	var v reportResult
+	if err := recordViolations(tx, inst.InstallID, req.Seq, bad, &v); err != nil { // 要在 OnReassign(以后可能扣费)之前
 		return err
 	}
 	if err := s.billing.OnReassign(ctx, tx, req.AppKey, req.Measurements); err != nil { // 留桩：默认不扣
@@ -125,7 +181,8 @@ func (s *Service) reassignOnReport(ctx context.Context, tx *gorm.DB, req protoco
 	s.log.Info("install_id reassigned", "reason", protocol.ReasonUnregistered, "old", req.InstallID, "new", inst.InstallID)
 
 	*res = reportResult{respType: protocol.TypeRefused, reason: protocol.ReasonUnregistered,
-		installID: inst.InstallID, seq: req.Seq, acked: req.Counters.Sessions, appKey: req.AppKey, needQuota: true}
+		installID: inst.InstallID, seq: req.Seq, acked: req.Counters.Sessions, appKey: req.AppKey, needQuota: true,
+		bad: v.bad, violation: v.violation}
 	return nil
 }
 

@@ -18,6 +18,7 @@ import (
 	"github.com/FacePhys/Afu-Server-demo/internal/config"
 	"github.com/FacePhys/Afu-Server-demo/internal/protocol"
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
+	"github.com/FacePhys/Afu-Server-demo/internal/violation"
 )
 
 // 集成测试连真实MySQL：AFU_TEST_DSN 指向专用测试库，测试会清空三张表。
@@ -52,7 +53,7 @@ func setupDB(t *testing.T) *gorm.DB {
 	if err := store.ApplyMigrations(db, "../../migrations"); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"installs", "reports", "measurements", "app_keys", "billing_ledger"} {
+	for _, table := range []string{"installs", "reports", "measurements", "app_keys", "billing_ledger", "install_violations"} {
 		if err := db.Exec("TRUNCATE TABLE " + table).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -96,7 +97,7 @@ func setupServer(t *testing.T) (http.Handler, *gorm.DB) {
 	db := setupDB(t)
 	seed(t, db)
 	s := newTestServer(t, fstest.MapFS{})
-	s.db = db
+	s.db, s.violations = db, violation.New(db, nil)
 	s.now = func() time.Time { return utc("2026-10-26T04:00:00Z") } // 北京时间10-26 12:00
 	return s.Router(), db
 }
@@ -424,5 +425,87 @@ func TestIntegrationReportCharge(t *testing.T) {
 	r := getJSON[Report](t, h, api+"/reports/"+itoa(p.Items[1].ID))
 	if r.Charge != 5000 {
 		t.Fatalf("详情扣费 = %d", r.Charge)
+	}
+}
+
+func TestIntegrationViolations(t *testing.T) {
+	h, db := setupServer(t)
+	// A、B 用 AK1(违规上限3)，C 用 AK2(不限)；A 违规3次(停发)，C 违规1次
+	for _, k := range []store.AppKey{{AppKey: "AK1", Status: store.AppKeyEnabled, MaxViolations: 3}, {AppKey: "AK2", Status: store.AppKeyEnabled}} {
+		if err := db.Create(&k).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+	lastAt := utc("2026-10-26T03:00:00Z")
+	for _, v := range []store.InstallViolation{{InstallID: idA, Count: 3, Total: 3, LastSeq: 2, LastNo: 2, LastAt: &lastAt}, {InstallID: idC, Count: 1, Total: 1}} {
+		if err := db.Create(&v).Error; err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	list := getJSON[Page[Install]](t, h, api+"/installs")
+	got := map[string]Violations{}
+	for _, it := range list.Items {
+		got[it.InstallID] = it.Violations
+	}
+	if a := got[idA]; a.Count != 3 || a.Total != 3 || a.Limit != 3 || !a.Stopped || a.LastSeq != 2 || a.LastAt == nil || !a.LastAt.Equal(lastAt) {
+		t.Fatalf("A = %+v", a)
+	}
+	if c := got[idC]; c.Count != 1 || c.Limit != 0 || c.Stopped {
+		t.Fatalf("C(不限) = %+v", c)
+	}
+	if b := got[idB]; b != (Violations{Limit: 3}) {
+		t.Fatalf("B(没有违规) = %+v", b)
+	}
+	for q, want := range map[string]string{"violation=any": idC + "," + idA, "violation=stopped": idA} {
+		var ids []string
+		for _, it := range getJSON[Page[Install]](t, h, api+"/installs?"+q).Items {
+			ids = append(ids, it.InstallID)
+		}
+		if strings.Join(ids, ",") != want {
+			t.Fatalf("%s: %v", q, ids)
+		}
+	}
+	if w := get(t, h, api+"/installs?violation=x", testToken); w.Code != http.StatusBadRequest {
+		t.Fatalf("非法筛选: %d", w.Code)
+	}
+
+	// 清零：次数归0、历史累计不变、记操作人，恢复下发
+	w := send(t, h, http.MethodPost, api+"/installs/"+idA+"/violations/reset", "")
+	var reset Install
+	json.Unmarshal(w.Body.Bytes(), &reset)
+	if v := reset.Violations; w.Code != http.StatusOK || v.Count != 0 || v.Total != 3 || v.Stopped || v.ResetBy != "alice" || v.ResetAt == nil {
+		t.Fatalf("清零: %d %s", w.Code, w.Body)
+	}
+	if d := getJSON[Install](t, h, api+"/installs/"+idA); d.Violations.Count != 0 || d.Violations.Stopped {
+		t.Fatalf("清零后详情 = %+v", d.Violations)
+	}
+	if w := send(t, h, http.MethodPost, api+"/installs/"+idB+"/violations/reset", ""); w.Code != http.StatusOK {
+		t.Fatalf("没有违规也能清零(什么也不做): %d %s", w.Code, w.Body)
+	}
+	if w := send(t, h, http.MethodPost, api+"/installs/dddddddddddddddddddddddddddddddd/violations/reset", ""); w.Code != http.StatusNotFound {
+		t.Fatalf("不存在的编号: %d", w.Code)
+	}
+
+	// App Key 的违规上限：默认3，可以改，最大1000，0为不限
+	const base = api + "/app-keys"
+	var k AppKey
+	w = send(t, h, http.MethodPost, base, `{"remark":"违规"}`)
+	json.Unmarshal(w.Body.Bytes(), &k)
+	if w.Code != http.StatusCreated || k.MaxViolations != store.DefaultMaxViolations {
+		t.Fatalf("默认上限: %d %s", w.Code, w.Body)
+	}
+	w = send(t, h, http.MethodPatch, base+"/"+itoa(k.ID), `{"max_violations":0}`)
+	json.Unmarshal(w.Body.Bytes(), &k)
+	if w.Code != http.StatusOK || k.MaxViolations != 0 {
+		t.Fatalf("改成不限: %d %s", w.Code, w.Body)
+	}
+	for _, body := range []string{`{"max_violations":1001}`, `{"max_violations":-1}`} {
+		if w := send(t, h, http.MethodPatch, base+"/"+itoa(k.ID), body); w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: %d", body, w.Code)
+		}
+	}
+	if w := send(t, h, http.MethodPost, base, `{"max_violations":1001}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("创建时超过上限: %d", w.Code)
 	}
 }

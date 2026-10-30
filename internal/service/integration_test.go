@@ -20,6 +20,7 @@ import (
 	"github.com/FacePhys/Afu-Server-demo/internal/config"
 	"github.com/FacePhys/Afu-Server-demo/internal/protocol"
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
+	"github.com/FacePhys/Afu-Server-demo/internal/violation"
 )
 
 // 集成测试连真实MySQL：AFU_TEST_DSN 指向一个专用测试库，测试会清空其中的三张表。
@@ -62,7 +63,7 @@ func setup(t *testing.T) (*Service, *countingBilling, *gorm.DB) {
 	if err := store.ApplyMigrations(db, "../../migrations"); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"installs", "reports", "measurements", "app_keys", "billing_ledger"} {
+	for _, table := range []string{"installs", "reports", "measurements", "app_keys", "billing_ledger", "install_violations"} {
 		if err := db.Exec("TRUNCATE TABLE " + table).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -71,7 +72,7 @@ func setup(t *testing.T) (*Service, *countingBilling, *gorm.DB) {
 		t.Fatal(err)
 	}
 	b := &countingBilling{}
-	return New(db, b, billing.LogNotifier{Log: log}, meterCfg, log), b, db
+	return New(db, b, billing.LogNotifier{Log: log}, violation.New(db, nil), meterCfg, log), b, db
 }
 
 const testInstallID = "ebedf529617fd42a433665cfd9150d46"
@@ -190,7 +191,7 @@ func TestIntegrationOfflineRuns(t *testing.T) {
 func TestIntegrationSessionsOverCap(t *testing.T) {
 	_, b, db := setup(t)
 	var buf bytes.Buffer
-	s := New(db, b, billing.LogNotifier{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, meterCfg,
+	s := New(db, b, billing.LogNotifier{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}, violation.New(db, nil), meterCfg,
 		slog.New(slog.NewTextHandler(&buf, nil)))
 	ctx := context.Background()
 	s.Register(ctx, registerReq(testInstallID))
@@ -401,7 +402,7 @@ func TestIntegrationKeyBilling(t *testing.T) {
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
 	notifier := &countingNotifier{}
-	s := New(db, billing.KeyBilling{DB: db}, notifier, meterCfg, log)
+	s := New(db, billing.KeyBilling{DB: db}, notifier, violation.New(db, nil), meterCfg, log)
 
 	// 单价0.50元，余额1.00元，透支额度1.00元
 	key := store.AppKey{AppKey: "AK-bill", Status: store.AppKeyEnabled, OfflineRuns: 10, UnitPrice: uint64(yuan(0.5)),
@@ -493,7 +494,7 @@ func TestIntegrationKeyBillingFreeAndConcurrent(t *testing.T) {
 	_, _, db := setup(t)
 	ctx := context.Background()
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	s := New(db, billing.KeyBilling{DB: db}, billing.LogNotifier{Log: log}, meterCfg, log)
+	s := New(db, billing.KeyBilling{DB: db}, billing.LogNotifier{Log: log}, violation.New(db, nil), meterCfg, log)
 
 	// AK-demo 单价0：不扣钱，照常计次、记流水；改成0.01元后，20台设备同时上报，余额一分不差
 	db.Model(&store.AppKey{}).Where("app_key = ?", "AK-demo").Updates(map[string]any{"unit_price": yuan(0.01), "balance": yuan(1)})

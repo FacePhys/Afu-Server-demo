@@ -30,7 +30,7 @@ func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (strin
 		Platform: req.Platform, SDK: req.SDK, ResetReason: req.Reset}
 	err = db.Create(&inst).Error
 	if err == nil {
-		return protocol.TypeAck, s.ack(inst.InstallID, 0, 0, key, hasQuota), nil
+		return protocol.TypeAck, s.ack(inst.InstallID, 0, 0, capRuns(key, hasQuota, 0)), nil // 新编号没有违规
 	}
 	if !errors.Is(err, gorm.ErrDuplicatedKey) {
 		return "", nil, err
@@ -42,5 +42,5 @@ func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (strin
 		return "", nil, err
 	}
 	s.log.Info("install_id reassigned", "reason", protocol.ReasonConflict, "old", req.InstallID, "new", newInst.InstallID)
-	return protocol.TypeRefused, s.refused(newInst.InstallID, 0, 0, key, hasQuota, protocol.ReasonConflict), nil
+	return protocol.TypeRefused, s.refused(newInst.InstallID, 0, 0, capRuns(key, hasQuota, 0), protocol.ReasonConflict), nil
 }

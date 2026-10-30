@@ -138,7 +138,7 @@ func TestBadPayloadLogsReason(t *testing.T) {
 	r := New(&fakeService{}, keys{1: k}, 64<<10, slog.New(slog.NewJSONHandler(&logs, nil))).Router()
 
 	plain := []byte(`{"install_id":"` + installID + `","app_key":"a","app_id":"b","platform":"ios","seq":7,"ts":1,"sdk":"1",` +
-		`"measurements":[{"no":3,"start_ts":2000,"end_ts":1000,"frames":151,"dt_ms":5033}]}`)
+		`"measurements":[{"no":3,"start_ts":2000,"end_ts":1000,"frames":151,"dt_ms":5033},{"no":0,"start_ts":1,"end_ts":2,"frames":151,"dt_ms":5033}]}`)
 	ct, _, _ := envelope.SealRequest(&k.PublicKey, 1, 1, protocol.TypeReport, plain)
 	w := do(t, r, envelopeJSON(t, 1, 1, protocol.TypeReport, ct))
 	var body map[string]string
@@ -157,7 +157,7 @@ func TestBadPayloadLogsReason(t *testing.T) {
 	}
 	warn, access := byMsg["bad payload"], byMsg["request"]
 	if warn["level"] != "WARN" || warn["type"] != protocol.TypeReport || warn["install_id"] != installID || warn["seq"] != float64(7) ||
-		warn["reason"] != "invalid payload: measurements[0] no=3 start_ts=2000 end_ts=1000" {
+		warn["reason"] != "invalid payload: measurements[1] no=0" { // start_ts > end_ts 不拒绝，第0条不报
 		t.Fatalf("WARN日志 = %v", warn)
 	}
 	if access["result"] != "bad_payload" || access["install_id"] != installID || access["seq"] != float64(7) {

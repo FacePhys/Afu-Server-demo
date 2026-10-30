@@ -15,6 +15,7 @@ import (
 	"gorm.io/gorm"
 
 	"github.com/FacePhys/Afu-Server-demo/internal/config"
+	"github.com/FacePhys/Afu-Server-demo/internal/violation"
 )
 
 // apiPrefix 是后台接口前缀，所有接口统一带 /afu 前缀；前端页面仍在根路径。
@@ -24,15 +25,17 @@ const apiPrefix = "/afu/internal/api/"
 const queryTimeout = 5 * time.Second
 
 type Server struct {
-	db     *gorm.DB
-	tokens []tokenEntry
-	meta   Meta
-	static fs.FS // 前端构建产物(web/dist)
-	log    *slog.Logger
-	now    func() time.Time // 测试可替换
+	db         *gorm.DB
+	violations *violation.Store // 违规清零：写 MySQL 后同步缓存
+	tokens     []tokenEntry
+	meta       Meta
+	static     fs.FS // 前端构建产物(web/dist)
+	log        *slog.Logger
+	now        func() time.Time // 测试可替换
 }
 
-func New(db *gorm.DB, cfg config.AdminConfig, meter config.MeterConfig, activeKids []int, static fs.FS, log *slog.Logger) (*Server, error) {
+func New(db *gorm.DB, violations *violation.Store, cfg config.AdminConfig, meter config.MeterConfig, activeKids []int, static fs.FS,
+	log *slog.Logger) (*Server, error) {
 	tokens, err := loadTokens(cfg.Tokens)
 	if err != nil {
 		return nil, err
@@ -40,7 +43,7 @@ func New(db *gorm.DB, cfg config.AdminConfig, meter config.MeterConfig, activeKi
 	kids := slices.Clone(activeKids)
 	slices.Sort(kids)
 	meta := Meta{TTLSec: meter.TTLSec, ReportSec: meter.ReportSec, ActiveKids: kids, Version: buildVersion()}
-	return &Server{db: db, tokens: tokens, meta: meta, static: static, log: log, now: time.Now}, nil
+	return &Server{db: db, violations: violations, tokens: tokens, meta: meta, static: static, log: log, now: time.Now}, nil
 }
 
 func (s *Server) Router() *gin.Engine {
@@ -57,6 +60,7 @@ func (s *Server) Router() *gin.Engine {
 	api.GET("/stats/daily", s.handleDaily)
 	api.GET("/installs", s.handleInstalls)
 	api.GET("/installs/:install_id", s.handleInstall)
+	api.POST("/installs/:install_id/violations/reset", s.handleResetViolations)
 	api.GET("/reports", s.handleReports)
 	api.GET("/reports/:id", s.handleReport)
 	api.GET("/app-keys", s.handleAppKeys)

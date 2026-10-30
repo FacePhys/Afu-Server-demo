@@ -32,7 +32,7 @@ func newTestServer(t *testing.T, static fs.FS) *Server {
 	gin.SetMode(gin.TestMode)
 	cfg := config.AdminConfig{Tokens: []config.AdminToken{tokenCfg("alice", testToken), tokenCfg("bob", "other")}}
 	meter := config.MeterConfig{TTLSec: 86400, ReportSec: 60}
-	s, err := New(nil, cfg, meter, []int{3, 1}, static, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	s, err := New(nil, nil, cfg, meter, []int{3, 1}, static, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	if err != nil {
 		t.Fatal(err)
 	}

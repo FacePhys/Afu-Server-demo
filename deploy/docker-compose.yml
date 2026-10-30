@@ -35,6 +35,10 @@ services:
         condition: service_healthy
     environment:
       AFU_DB_DSN: ${AFU_DB_DSN:?请在 .env 里设置 AFU_DB_DSN}
+      AFU_REDIS_ADDR: ${AFU_REDIS_ADDR:-}           # 违规次数的缓存，留空不用 Redis(直接查库)
+      AFU_REDIS_PASSWORD: ${AFU_REDIS_PASSWORD:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"         # 连宿主机上的 Redis，见部署说明「Redis」
     ports:
       - "${AFU_HTTP_BIND:-127.0.0.1}:${AFU_HTTP_PORT:-8080}:8080"   # SDK上报：默认只给本机nginx访问；用云负载均衡时 AFU_HTTP_BIND=0.0.0.0
       - "127.0.0.1:${AFU_ADMIN_PORT:-18081}:18081"                 # 内部后台只绑宿主机本地，用 SSH 隧道访问

@@ -6,12 +6,13 @@
 
 | 项目       | 选型                                                              | 说明                                                                                |
 | ---------- | ----------------------------------------------------------------- | ----------------------------------------------------------------------------------- |
-| 语言       | Go 1.27                                                           | 最低要求 1.25(Gin v1.12等依赖要求；代码用到 1.24 的 `cipher.NewGCMWithRandomNonce`) |
+| 语言       | Go 1.27                                                           | 最低要求 1.26(go-redis v9.23 要求；代码用到 1.24 的 `cipher.NewGCMWithRandomNonce`) |
 | http框架   | Gin                                                               | 只有一个路由 `POST /afu/v1/meter`                                                   |
 | 数据库     | MySQL 8(InnoDB，utf8mb4)                                          | 需要事务和行锁(`SELECT ... FOR UPDATE`)                                             |
 | 数据库访问 | GORM(`gorm.io/gorm` + `gorm.io/driver/mysql`)                     | 建表仍用SQL文件，不用AutoMigrate；锁和冲突处理显式写Clauses，见「GORM使用约定」     |
 | 加解密     | 标准库 `crypto/rsa`、`crypto/aes`、`crypto/cipher`、`crypto/rand` | 不引入第三方加密库                                                                  |
-| 配置       | YAML(`gopkg.in/yaml.v3`)，数据库连接串可用环境变量覆盖            |                                                                                     |
+| 缓存       | Redis(`github.com/redis/go-redis/v9`)，可选                       | 只缓存违规次数，可以和其他服务共用(key 带前缀)；MySQL 是唯一准数据，见「违规计数」  |
+| 配置       | YAML(`gopkg.in/yaml.v3`)，数据库连接串、Redis地址和密码可用环境变量覆盖 |                                                                               |
 | 日志       | 标准库 `log/slog`，JSON输出                                       |                                                                                     |
 | 测试       | 标准库 `testing` + `net/http/httptest`；集成测试连本地MySQL       |                                                                                     |
 
@@ -30,10 +31,11 @@
 │   ├── handler/              # Gin路由、「通用处理」10步
 │   ├── service/              # 注册处理、上报处理、换号、回复字段计算、install_id生成
 │   ├── billing/              # 计费接口：KeyBilling 按次计费(单价 × 新增计次，从余额扣)，其余规则留桩
+│   ├── violation/            # 违规计数：起止时间颠倒的计次记录按设备累计，达到上限停发；Redis 缓存
 │   ├── store/                # MySQL读写
 │   └── console/              # 内部数据后台的只读接口，见 docs/internal-console.md
 ├── web/                      # 内部数据后台前端(React + Ant Design)，构建产物打进二进制
-├── migrations/               # 建表、改表：001_init.sql ~ 005_report_deltas.sql，按文件名顺序执行
+├── migrations/               # 建表、改表：001_init.sql ~ 006_violations.sql，按文件名顺序执行
 ├── configs/config.example.yaml
 ├── keys/                     # 本地私钥，不提交
 ├── docker-compose.yml        # 本地MySQL
@@ -43,7 +45,7 @@
 └── go.mod                    # module github.com/FacePhys/Afu-Server-demo
 ```
 
-依赖方向：`handler → service → store / billing`，`handler → envelope / keystore / protocol`。`service` 不感知http和加密，方便单测。
+依赖方向：`handler → service → store / billing / violation`，`handler → envelope / keystore / protocol`。`service` 不感知http和加密，方便单测。
 
 ## 配置
 
@@ -69,6 +71,12 @@ keys:                           # 只加载 status = active 的密钥，其余ki
 meter:                          # cap_runs 取 App Key 的离线可用次数(内部后台配置)，cap_frames 固定为0，都不在配置里
   ttl_sec: 0                    # 原样下发；0 = 额度不限时
   report_sec: 60                # 原样下发，SDK 不用
+
+redis:                          # 违规次数的缓存，可选；留空 addr 时直接查库
+  addr: ""                      # 如 "127.0.0.1:6379"；环境变量 AFU_REDIS_ADDR 优先
+  password: ""                  # 环境变量 AFU_REDIS_PASSWORD 优先，建议只用环境变量
+  db: 0
+  key_prefix: "afu:"            # 所有 key 的前缀，和共用这个 Redis 的其他服务区分
 
 log:
   level: info
@@ -128,7 +136,7 @@ CREATE TABLE IF NOT EXISTS measurements (
 ```
 
 1. 列名避开MySQL关键字：`reset` → `reset_reason`，`no` → `measure_no`。
-2. App Key 表在 `migrations/002_app_keys.sql`(app_key 列用 utf8mb4_bin，区分大小写)，由内部后台生成或导入；`003_billing.sql` 加了单价 `unit_price`、余额 `balance`、透支额度 `overdraft_limit`、累计计费次数 `used_count` 和计费流水表 `billing_ledger`；金额一律用整数，单位 0.0001 元；`004_offline_runs.sql` 加了离线可用次数 `offline_runs`(默认5，后台限制0~16)；`005_report_deltas.sql` 给 `reports` 加了本次增量 `delta_sessions`、`delta_frames`、`delta_dt_ms`(后台按天统计用)，并按 measurements 补算了升级前的上报。
+2. App Key 表在 `migrations/002_app_keys.sql`(app_key 列用 utf8mb4_bin，区分大小写)，由内部后台生成或导入；`003_billing.sql` 加了单价 `unit_price`、余额 `balance`、透支额度 `overdraft_limit`、累计计费次数 `used_count` 和计费流水表 `billing_ledger`；金额一律用整数，单位 0.0001 元；`004_offline_runs.sql` 加了离线可用次数 `offline_runs`(默认5，后台限制0~16)；`005_report_deltas.sql` 给 `reports` 加了本次增量 `delta_sessions`、`delta_frames`、`delta_dt_ms`(后台按天统计用)，并按 measurements 补算了升级前的上报；`006_violations.sql` 加了违规记录表 `install_violations` 和 App Key 的违规上限 `max_violations`(默认3，0为不限)，见「违规计数」。
 3. 客户的表等计费细则同步后再设计，现在不建。
 4. 写measurements要忽略重复的no：`Clauses(clause.OnConflict{DoNothing: true})`，在MySQL下生成 `ON DUPLICATE KEY UPDATE id=id`。不要用 `INSERT IGNORE`，它会把截断等其他错误也吞掉。
 5. 唯一键冲突判断：开启 `TranslateError` 后用 `errors.Is(err, gorm.ErrDuplicatedKey)`，驱动会把MySQL错误码1062转换成它。
@@ -310,12 +318,12 @@ type Refused struct {
 | reset                | 空、corrupt、conflict、unregistered之一(后两个客户端不会发，收到也不拒绝)                                                                        |
 | ts                   | 大于0                                                                                                                                            |
 | seq(上报)            | 大于等于1                                                                                                                                        |
-| measurements         | 最多16条(防御性上限)；每条no大于等于1、end_ts大于等于start_ts                                                                                    |
+| measurements         | 最多16条(防御性上限)；每条no大于等于1。start_ts > end_ts 不拒绝：照常入库扣费，记一次违规，见「违规计数」                                         |
 
 1. 计数类字段是 `uint64`，传负数会在json解析时失败，同样返回bad_payload。
 2. 明文里出现未知字段不报错，方便客户端先加字段。
 3. `measurements[].dt_ms ≤ 5000` 不拒绝，只记录异常日志；拒绝会让客户端一直重试同一份上报。
-4. 不通过时记一条 `bad payload` WARN 日志：type、kid、install_id(格式正确时，访问日志里也带上)、seq，reason 是具体原因，例如 `invalid payload: measurements[0] no=3 start_ts=2000 end_ts=1000`，json 解析失败时是 json 的报错(带字段路径)。不记明文，客户端传来的字符串截断到64字节、整条原因截断到256字节；客户端仍只收到 bad_payload。
+4. 不通过时记一条 `bad payload` WARN 日志：type、kid、install_id(格式正确时，访问日志里也带上)、seq，reason 是具体原因，例如 `invalid payload: measurements[1] no=0`，json 解析失败时是 json 的报错(带字段路径)。不记明文，客户端传来的字符串截断到64字节、整条原因截断到256字节；客户端仍只收到 bad_payload。
 
 ### 错误码
 
@@ -543,7 +551,9 @@ type reportResult struct {
 	appKey    string
 	needQuota bool // 重复上报、换号：事务提交后再查额度
 	charge    billing.ChargeResult
-	reason    string // 换号时为 unregistered
+	reason    string                 // 换号时为 unregistered
+	bad       []protocol.Measurement // 这份上报新出现的违规计次记录(start_ts > end_ts)
+	violation *violation.State       // 有新违规时，事务里累计后的状态
 }
 
 func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte) (string, any, error) {
@@ -577,11 +587,18 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 		if delta.Sessions > key.OfflineRuns { // SDK 最多先用 cap_runs 次，超了说明 SDK 被改过或有 bug
 			s.log.Warn("sessions delta exceeds cap_runs", "install_id", inst.InstallID, "seq", req.Seq)
 		}
+		bad, err := violation.Detect(tx, inst.InstallID, req.Measurements) // 新出现的违规计次，要在保存 measurements 之前
+		if err != nil {
+			return err
+		}
 		// 保存明文和本次增量(后台按天统计用)；measurements 重复的no忽略
 		if err := saveReport(tx, inst.InstallID, req, raw, delta); err != nil {
 			return err
 		}
-		charge, err := s.billing.Charge(ctx, tx, billing.ChargeRequest{ // 按新增计次扣费、判断额度
+		if err := recordViolations(tx, inst.InstallID, req.Seq, bad, &res); err != nil { // 累计违规，要在扣费(锁 App Key)之前
+			return err
+		}
+		charge, err := s.billing.Charge(ctx, tx, billing.ChargeRequest{ // 按新增计次扣费(违规的计次照常扣)、判断额度
 			AppKey: req.AppKey, InstallID: inst.InstallID, Seq: req.Seq, Delta: delta})
 		if err != nil {
 			return err
@@ -608,11 +625,17 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 	if res.charge.Warn { // 预警通知放在事务外异步发送
 		go s.notifier.QuotaWarning(context.WithoutCancel(ctx), res.appKey)
 	}
-
-	if res.respType == protocol.TypeRefused {
-		return protocol.TypeRefused, s.refused(res.installID, res.seq, res.acked, key, hasQuota, res.reason), nil
+	// 这份上报新增了违规：用事务里的值，写缓存、记日志；否则查缓存(不能用时查库)
+	violations, err := s.violationCount(ctx, key, req.Seq, &res)
+	if err != nil {
+		return "", nil, err
 	}
-	return protocol.TypeAck, s.ack(res.installID, res.seq, res.acked, key, hasQuota), nil
+
+	caps := capRuns(key, hasQuota, violations)
+	if res.respType == protocol.TypeRefused {
+		return protocol.TypeRefused, s.refused(res.installID, res.seq, res.acked, caps, res.reason), nil
+	}
+	return protocol.TypeAck, s.ack(res.installID, res.seq, res.acked, caps), nil
 }
 ```
 
@@ -620,27 +643,26 @@ func (s *Service) Report(ctx context.Context, req protocol.ReportReq, raw []byte
 
 1. 校验app_key、app_id(留桩放行)。
 2. 生成新install_id，插入安装记录：`reset_reason = unregistered`，`confirmed_seq = req.Seq`，已确认counters = `req.Counters`(作为基线)。
-3. 以新编号保存本次上报和measurements，本次增量记为0(基线)。
+3. 以新编号保存本次上报和measurements，本次增量记为0(基线)；带了起止时间颠倒的计次记录时给新编号累计违规(在 `OnReassign` 之前，保持加锁顺序)。
 4. 触发换号的这次测量是否计费：调用 `billing.OnReassign` 留桩，默认不扣。
 5. 设置 `res.appKey = req.AppKey`、`res.acked = req.Counters.Sessions`、`res.needQuota = true`；事务提交后查额度，返回 `refused(unregistered)`：install_id为新编号，seq为 `req.Seq`，其余按「回复字段计算」组装。
 
 ### 回复字段计算
 
-注册、上报开头的 `loadAppKey` 校验 app_key 时顺带取出这个 App Key 的 `offline_runs`；事务提交后再查额度，组装回复：
+注册、上报开头的 `loadAppKey` 校验 app_key 时顺带取出这个 App Key 的 `offline_runs`、`max_violations`；事务提交后再查额度、违规次数，组装回复：
 
 ```go
-// acked 是已确认的累计计次；cap_runs 取 App Key 的离线可用次数，余额加透支额度不够付下一次时为0；cap_frames 固定为0。
-func (s *Service) ack(installID string, seq, acked uint64, key store.AppKey, hasQuota bool) protocol.Ack {
-	a := protocol.Ack{InstallID: installID, Seq: seq, AckedSessions: acked, TTLSec: s.cfg.TTLSec, ReportSec: s.cfg.ReportSec}
-	if hasQuota {
-		a.CapRuns = key.OfflineRuns
+// capRuns 取 App Key 的离线可用次数；余额加透支额度不够付下一次，或者设备的违规次数达到 App Key 的违规上限时为0(停发)。
+func capRuns(key store.AppKey, hasQuota bool, violations uint64) uint64 {
+	if !hasQuota || key.ViolationLimitReached(violations) { // 上限为0表示不限
+		return 0
 	}
-	return a
+	return key.OfflineRuns
 }
 ```
 
 1. acked：注册为0；正常上报为取大后的 `c_sessions`；重复上报为库里的 `c_sessions`；上报换号为 `req.Counters.Sessions`(基线)。
-2. 后台改了离线可用次数，从下一次回复开始生效；重复上报、换号的回复也按当前值下发。
+2. 后台改了离线可用次数、违规上限，清零了违规次数，都从下一次回复开始生效；重复上报、换号的回复也按当前值下发。注册拿到的是新编号，没有违规，不用查。
 3. 离线可用次数上限是 `protocol.MaxMeasurements`(16)：SDK 每份上报带全部没确认的计次，cap_runs 再大一份就装不下，会一直400。
 
 ## 计费(internal/billing)
@@ -668,13 +690,61 @@ type Notifier interface {
 服务启动用 `billing.KeyBilling`，按次计费：
 
 1. 金额一律用整数，单位 0.0001 元(`store.MoneyUnitsPerYuan` = 10000)，避免小数误差。
-2. 扣费：`Charge` 在上报事务里先 `FOR UPDATE` 锁住这个 App Key 的行，余额减去 `delta.Sessions × unit_price`，`used_count += delta.Sessions`，再记一条扣费流水(install_id、seq、次数、单价、扣后余额)。同一个 App Key 的扣费串行，加锁顺序固定为「安装记录 → App Key」，不会死锁。
+2. 扣费：`Charge` 在上报事务里先 `FOR UPDATE` 锁住这个 App Key 的行，余额减去 `delta.Sessions × unit_price`，`used_count += delta.Sessions`，再记一条扣费流水(install_id、seq、次数、单价、扣后余额)。同一个 App Key 的扣费串行，加锁顺序固定为「安装记录 → 违规记录 → App Key」，不会死锁。
 3. 额度：单价为0不收费(照常计次、记流水)；`balance + overdraft_limit ≥ unit_price` 时还发额度，否则停发(ack / refused 的 cap_runs 为0)。
 4. 计费状态：`free` 不收费、`normal` 余额不为负、`overdraft` 余额为负但还够付一次、`exhausted` 停发。进入 `overdraft` 或 `exhausted` 时 `ChargeResult.Warn` 为 true，`LogNotifier` 记一条 `quota warning` 日志。
 5. 重复上报、空上报、计数变小时增量为0，不扣费；上报换号时以本次计数为基线，触发换号的这次测量不扣费。
 6. 允许超出：额度是在发回复时判断的，停发之前已经放出去的次数不会收回，设备照常用完，联网补报时照常扣费，所以余额最多比透支额度再低「活跃设备数 × cap_runs × 单价」。离线可用次数设得越大，可能超出得越多。
 7. 余额只能通过充值(内部后台)和上报扣费变化，按 id 顺序累加流水金额等于当前余额。
 8. `ValidateApp`、`OnReassign` 仍用 `Noop` 的留桩实现；计费细则同步后在 `KeyBilling` 上扩展，service层不用改。
+
+## 违规计数(internal/violation)
+
+### 规则
+
+1. 上报里的计次记录 start_ts > end_ts(起始时间晚于结束时间，比如测量中途设备时间被往回调)算一次违规。不拒收：照常入库、按计次扣费，给这台设备(install_id)累计违规次数。拒收的话设备会一直重发同一份上报，永远过不去。
+2. 一条计次记录(install_id + no)只算一次：`violation.Detect` 在保存 measurements 之前，排除这台设备已经保存过的编号，回复丢了重发、合并成新 seq 重发都不重复算；重复上报(seq ≤ 已确认)不入库，也不算。
+3. 违规上限是 App Key 的 `max_violations`(后台修改，默认3，0为不限，最大1000)。设备的违规次数达到上限后，给它的回复 cap_runs 为0(停发)；上报照常接收、扣费。
+4. 后台清零：违规次数归0、`epoch` 加1、记操作人；历史累计 `total_count` 不变。
+5. 违规次数跟着 install_id 走，设备清数据重新注册拿到新编号后从0开始(协议里没有设备指纹)。
+
+### 表
+
+`install_violations`：install_id 主键，`violation_count` 当前次数，`total_count` 历史累计，`epoch` 清零次数，最近一次违规的 `last_seq`、`last_no`、`last_at`，最近清零的 `reset_by`、`reset_at`。明细不另存，就是 measurements 里 start_ts > end_ts 的行。
+
+上报事务里用 `INSERT ... ON DUPLICATE KEY UPDATE violation_count = violation_count + n` 累计，再读回 `(epoch, violation_count)`。加锁顺序：安装记录(`FOR UPDATE`) → 违规记录 → App Key(扣费)。
+
+### Redis 缓存和一致性
+
+Redis 只缓存违规次数，可以和其他服务共用一个 Redis，所有 key 带 `redis.key_prefix`(默认 `afu:`)：
+
+| key                                  | 类型   | 内容                                                                                   |
+| ------------------------------------ | ------ | -------------------------------------------------------------------------------------- |
+| `<prefix>violations`                 | hash   | field 是 install_id，value 是 `epoch:违规次数`；没有 field 表示没有违规                |
+| `<prefix>violations:ready`           | string | 就绪标记：存在表示 hash 是完整的(全量加载过)。Redis 重启、被清空后就没了               |
+| `<prefix>violations:build:<随机>`    | hash   | 全量重建时的临时 key，加载完 RENAME 成正式的；带10分钟过期，重建中途退出也不会留下垃圾 |
+
+一致性：
+
+1. **MySQL 是唯一准数据。** 累计、清零都在 MySQL 事务里做；提交之后才写 Redis，写的是事务里读到的值，不是 INCR。Redis 里不会出现 MySQL 回滚掉的值，重试、重复写也不会多算。
+2. **写 Redis 按 `(epoch, 次数)` 只增不减(Lua 脚本，比现有值大才写)。** 两个请求提交后写 Redis 的顺序乱了、清零前提交的旧值晚到，都盖不过新值；清零让 epoch 加1，所以清零后的0能盖过清零前的大数。
+3. **停发与否在出现违规的那次上报里按事务内的值判断，不看缓存**，达到上限的那次回复一定是0。其余请求(重复上报、没有新违规的上报)才读缓存；注册拿到的是新编号，不用查。
+4. **启动时全量同步。** 服务启动先把 `install_violations` 全部加载进 Redis：写临时 hash → RENAME 成正式的(原子替换，库里没有的脏数据一起去掉) → 设就绪标记。加载失败照常启动，查库。
+5. **缓存不确定时查库。** 读 Redis 的脚本先看就绪标记，没有就返回空，改查库。本进程读写 Redis 出错(超时、连不上、就绪标记没了)就不再读缓存、全部查库，并删掉就绪标记，让共用这个 Redis 的其他实例也改查库。
+6. **自动恢复。** 后台每10秒检查一次：缓存不可读就全量重建，成功后恢复读缓存；另外每10分钟无条件全量重建一次，修正手动改库等绕过服务的改动。
+7. **重建期间的写不丢。** 重建时 RENAME 会盖掉重建期间写在旧 hash 上的值，所以 RENAME 之后把最近2分钟改过的行再按「只增不减」写一遍(按 `updated_at`，用数据库时间)；重建期间又出错时这次重建不算成功，下一轮再来。
+8. **Redis 出问题不拖慢上报。** 单次读写上限300毫秒；出错之后不再访问 Redis，直到重建成功。go-redis 自己的日志转成 JSON 记 Debug 级别，缓存停用、重建失败、恢复各记一条。
+
+| 情况                                   | 结果                                                                   |
+| -------------------------------------- | ---------------------------------------------------------------------- |
+| 提交 MySQL 后写 Redis 失败             | 本进程改查库、删就绪标记；10秒内全量重建后恢复                         |
+| 进程在提交 MySQL 和写 Redis 之间退出   | 重启时全量同步，补上                                                   |
+| Redis 重启、被清空、被淘汰             | 就绪标记没了 → 查库；10秒内全量重建                                    |
+| Redis 停掉                             | 查库；第一次请求最多多等300毫秒；Redis 回来后自动重建                  |
+| 手动改库(没走后台)                     | 最多10分钟后全量重建修正；要立刻生效就重启服务                         |
+| 清零和上报同时发生                     | 清零让 epoch 加1，清零前的旧值写不进来                                 |
+
+本地开发、测试不配 `redis.addr` 时不用 Redis，一律查库，结果一样。
 
 ## 本地开发
 
@@ -723,7 +793,8 @@ services:
 
 ### 集成测试(连本地MySQL，没设 `AFU_TEST_DSN` 就跳过)
 
-> 测试会清空 installs、reports、measurements、app_keys、billing_ledger 五张表，`AFU_TEST_DSN` 必须指向专用测试库。
+> 测试会清空 installs、reports、measurements、app_keys、billing_ledger、install_violations 六张表，`AFU_TEST_DSN` 必须指向专用测试库。
+> 设置了 `AFU_TEST_REDIS`(地址，密码用 `AFU_TEST_REDIS_PASSWORD`)时，违规相关的测试走 Redis 缓存，只用随机前缀下的 key，测完删掉；没设置时跳过 Redis 的测试，其余直接查库。
 
 | 场景                                           | 期望                                                                                                                                   |
 | ---------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
@@ -740,6 +811,8 @@ services:
 | 同一install_id并发上报                         | 串行处理，只扣一次                                                                                                                     |
 | App Key 单价0.50元、余额1.00元、透支额度1.00元 | 余额依次0.50 → 0 → −0.50(透支) → −1.00(停发，cap_runs = 0)；重复上报、空上报不扣费；每笔扣费一条流水；停发后注册 cap_runs = 0；预警2次 |
 | 20台设备并发上报同一个 App Key(单价0.01元)     | 余额正好少0.20元，流水合计−0.20元，计费次数20                                                                                          |
+| 起止时间颠倒的计次记录(违规上限2)              | 照常入库扣费，违规1次；合并重发不重复算；第2次违规那份上报的回复 cap_runs = 0，之后重复上报也是0；上限改成5、0(不限)或清零后恢复；未注册编号带违规上报，违规记在新编号上 |
+| Redis 缓存                                     | 启动全量加载；只增不减、清零前的旧值写不进来；就绪标记没了就查库，重建后恢复并去掉脏数据；Redis 不通时读写都很快失败、查库         |
 
 ### 端到端
 

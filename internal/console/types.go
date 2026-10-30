@@ -77,8 +77,22 @@ type Install struct {
 	ResetReason  string            `json:"reset_reason"`
 	ConfirmedSeq uint64            `json:"confirmed_seq"`
 	Counters     protocol.Counters `json:"counters"`
+	Violations   Violations        `json:"violations"`
 	CreatedAt    time.Time         `json:"created_at"`
 	UpdatedAt    time.Time         `json:"updated_at"`
+}
+
+// Violations 设备的违规情况：计次记录 start_ts > end_ts 算一次违规，达到 App Key 的违规上限后停发(cap_runs 为0)。
+type Violations struct {
+	Count   uint64     `json:"count"`    // 当前违规次数，清零后重新累计
+	Total   uint64     `json:"total"`    // 历史累计，清零不变
+	Limit   uint64     `json:"limit"`    // 安装记录的 App Key 的违规上限，0为不限
+	Stopped bool       `json:"stopped"`  // 达到上限，回复的 cap_runs 为0
+	LastSeq uint64     `json:"last_seq"` // 最近一次违规所在的上报
+	LastNo  uint64     `json:"last_no"`  // 最近一次违规的计次编号
+	LastAt  *time.Time `json:"last_at"`
+	ResetBy string     `json:"reset_by"` // 最近一次清零的操作人
+	ResetAt *time.Time `json:"reset_at"`
 }
 
 type Report struct {

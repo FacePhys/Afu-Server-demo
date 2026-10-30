@@ -112,6 +112,9 @@ const MoneyUnitsPerYuan = 10000
 // DefaultOfflineRuns 新建 App Key 时离线可用次数的默认值，与 004_offline_runs.sql 的列默认值一致。
 const DefaultOfflineRuns = 5
 
+// DefaultMaxViolations 新建 App Key 时违规上限的默认值，与 006_violations.sql 的列默认值一致。
+const DefaultMaxViolations = 3
+
 // AppKey 由内部后台生成或导入，注册、上报带的 app_key 必须存在且已启用。
 // 按次计费：每次上报按「新增计次 × 单价」从余额扣，余额加透支额度不够付下一次时停发额度。
 type AppKey struct {
@@ -124,6 +127,7 @@ type AppKey struct {
 	OverdraftLimit uint64    `gorm:"column:overdraft_limit"` // 透支额度，0.0001元
 	UsedCount      uint64    `gorm:"column:used_count"`      // 累计计费的计次
 	OfflineRuns    uint64    `gorm:"column:offline_runs"`    // 离线可用次数：从已确认往后还能新增几次计次，cap_runs 直接下发
+	MaxViolations  uint64    `gorm:"column:max_violations"`  // 违规上限：设备违规次数达到后停发；0为不限
 	CreatedBy      string    `gorm:"column:created_by"`
 	CreatedAt      time.Time `gorm:"column:created_at"`
 	UpdatedAt      time.Time `gorm:"column:updated_at"`
@@ -142,6 +146,11 @@ const (
 // HasQuota 余额加透支额度够不够付下一次测量。
 func (k AppKey) HasQuota() bool {
 	return k.UnitPrice == 0 || k.Balance+int64(k.OverdraftLimit) >= int64(k.UnitPrice)
+}
+
+// ViolationLimitReached 设备的违规次数达到这个 App Key 的违规上限：停发(cap_runs 为0)。上限为0表示不限。
+func (k AppKey) ViolationLimitReached(violations uint64) bool {
+	return k.MaxViolations > 0 && violations >= k.MaxViolations
 }
 
 // BillingState 计费状态，后台展示和预警用。
@@ -180,3 +189,21 @@ type LedgerEntry struct {
 }
 
 func (LedgerEntry) TableName() string { return "billing_ledger" }
+
+// InstallViolation 设备的违规计数：上报的计次记录 start_ts > end_ts 算一次违规，按 install_id 累计。
+// 本表是唯一准数据，Redis 只是缓存，见 internal/violation。
+type InstallViolation struct {
+	InstallID string     `gorm:"column:install_id;primaryKey"`
+	Count     uint64     `gorm:"column:violation_count"` // 当前违规次数，后台清零后重新累计
+	Total     uint64     `gorm:"column:total_count"`     // 历史累计，清零不变
+	Epoch     uint64     `gorm:"column:epoch"`           // 清零次数
+	LastSeq   uint64     `gorm:"column:last_seq"`
+	LastNo    uint64     `gorm:"column:last_no"`
+	LastAt    *time.Time `gorm:"column:last_at"`
+	ResetBy   string     `gorm:"column:reset_by"`
+	ResetAt   *time.Time `gorm:"column:reset_at"`
+	CreatedAt time.Time  `gorm:"column:created_at"`
+	UpdatedAt time.Time  `gorm:"column:updated_at"`
+}
+
+func (InstallViolation) TableName() string { return "install_violations" }

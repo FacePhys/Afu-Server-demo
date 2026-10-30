@@ -27,12 +27,30 @@ func TestLoadExample(t *testing.T) {
 
 func TestEnvOverridesDSN(t *testing.T) {
 	t.Setenv(EnvDSN, "override")
+	t.Setenv(EnvRedisAddr, "host.docker.internal:6379")
+	t.Setenv(EnvRedisPassword, "pw")
 	cfg, err := Load("../../configs/config.example.yaml")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.DB.DSN != "override" {
-		t.Fatalf("dsn = %q", cfg.DB.DSN)
+	if cfg.DB.DSN != "override" || cfg.Redis.Addr != "host.docker.internal:6379" || cfg.Redis.Password != "pw" ||
+		cfg.Redis.KeyPrefix != DefaultRedisKeyPrefix {
+		t.Fatalf("db = %+v, redis = %+v", cfg.DB, cfg.Redis)
+	}
+}
+
+func TestRedisValidate(t *testing.T) {
+	t.Setenv(EnvDSN, "")
+	t.Setenv(EnvRedisAddr, "")
+	path := filepath.Join(t.TempDir(), "c.yaml")
+	base := "db: {dsn: \"x\"}\nkeys: [{kid: 1, private_key_file: a, status: active}]\n"
+	os.WriteFile(path, []byte(base+"redis: {addr: \"127.0.0.1:6379\", key_prefix: \"\"}\n"), 0o600)
+	if _, err := Load(path); err == nil {
+		t.Fatal("启用 Redis 时 key_prefix 不能为空")
+	}
+	os.WriteFile(path, []byte(base), 0o600)
+	if cfg, err := Load(path); err != nil || cfg.Redis.Addr != "" || cfg.Redis.KeyPrefix != DefaultRedisKeyPrefix {
+		t.Fatalf("不配 Redis 也能启动: %+v %v", cfg, err)
 	}
 }
 

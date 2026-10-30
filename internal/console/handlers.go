@@ -168,10 +168,52 @@ type reportRow struct {
 	Charge int64 `gorm:"column:charge"`
 }
 
-func toInstall(r store.Install) Install {
+func toInstall(r store.Install, v Violations) Install {
 	return Install{InstallID: r.InstallID, AppID: r.AppID, Platform: r.Platform, SDK: r.SDK,
-		ResetReason: r.ResetReason, ConfirmedSeq: r.ConfirmedSeq, Counters: r.Counters(),
+		ResetReason: r.ResetReason, ConfirmedSeq: r.ConfirmedSeq, Counters: r.Counters(), Violations: v,
 		CreatedAt: r.CreatedAt.UTC(), UpdatedAt: r.UpdatedAt.UTC()}
+}
+
+// violationsOf 查出这些安装记录的违规情况：违规记录按 install_id 查，违规上限取安装记录的 App Key。
+func violationsOf(db *gorm.DB, rows []store.Install) (map[string]Violations, error) {
+	out := make(map[string]Violations, len(rows))
+	if len(rows) == 0 {
+		return out, nil
+	}
+	ids, appKeys := make([]string, 0, len(rows)), make([]string, 0, len(rows))
+	for _, r := range rows {
+		ids, appKeys = append(ids, r.InstallID), append(appKeys, r.AppKey)
+	}
+	var vs []store.InstallViolation
+	if err := db.Where("install_id IN ?", ids).Find(&vs).Error; err != nil {
+		return nil, err
+	}
+	var ks []store.AppKey
+	if err := db.Select("app_key", "max_violations").Where("app_key IN ?", appKeys).Find(&ks).Error; err != nil {
+		return nil, err
+	}
+	byID := make(map[string]store.InstallViolation, len(vs))
+	for _, v := range vs {
+		byID[v.InstallID] = v
+	}
+	keys := make(map[string]store.AppKey, len(ks))
+	for _, k := range ks {
+		keys[k.AppKey] = k
+	}
+	for _, r := range rows {
+		v, k := byID[r.InstallID], keys[r.AppKey]
+		out[r.InstallID] = Violations{Count: v.Count, Total: v.Total, Limit: k.MaxViolations, Stopped: k.ViolationLimitReached(v.Count),
+			LastSeq: v.LastSeq, LastNo: v.LastNo, LastAt: utcPtr(v.LastAt), ResetBy: v.ResetBy, ResetAt: utcPtr(v.ResetAt)}
+	}
+	return out, nil
+}
+
+func utcPtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+	u := t.UTC()
+	return &u
 }
 
 func (s *Server) handleInstalls(c *gin.Context) {
@@ -211,6 +253,17 @@ func (s *Server) handleInstalls(c *gin.Context) {
 		}
 		q = q.Where("reset_reason = ?", reason)
 	}
+	switch c.Query("violation") {
+	case "":
+	case "any": // 当前有违规(没清零)
+		q = q.Where("install_id IN (SELECT install_id FROM install_violations WHERE violation_count > 0)")
+	case "stopped": // 违规次数达到 App Key 的上限，停发中
+		q = q.Where(`EXISTS (SELECT 1 FROM install_violations AS v JOIN app_keys AS k ON k.app_key = installs.app_key
+WHERE v.install_id = installs.install_id AND k.max_violations > 0 AND v.violation_count >= k.max_violations)`)
+	default:
+		fail(c, errBadRequest)
+		return
+	}
 	q = timeRange(q, "created_at", from, to)
 	q, total, err := countPage(db, q, "installs", "id", &p)
 	if err != nil {
@@ -223,7 +276,12 @@ func (s *Server) handleInstalls(c *gin.Context) {
 		s.failErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, newPage(rows, p, total, toInstall))
+	vs, err := violationsOf(db, rows)
+	if err != nil {
+		s.failErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, newPage(rows, p, total, func(r store.Install) Install { return toInstall(r, vs[r.InstallID]) }))
 }
 
 func (s *Server) handleInstall(c *gin.Context) {
@@ -234,12 +292,53 @@ func (s *Server) handleInstall(c *gin.Context) {
 	}
 	db, cancel := s.query(c)
 	defer cancel()
-	var r store.Install
-	if err := db.Where("install_id = ?", id).Take(&r).Error; err != nil {
+	inst, err := installDetail(db, id)
+	if err != nil {
 		s.failErr(c, err)
 		return
 	}
-	c.JSON(http.StatusOK, toInstall(r))
+	c.JSON(http.StatusOK, inst)
+}
+
+func installDetail(db *gorm.DB, id string) (Install, error) {
+	var r store.Install
+	if err := db.Where("install_id = ?", id).Take(&r).Error; err != nil {
+		return Install{}, err
+	}
+	vs, err := violationsOf(db, []store.Install{r})
+	if err != nil {
+		return Install{}, err
+	}
+	return toInstall(r, vs[id]), nil
+}
+
+// handleResetViolations 违规清零：违规次数归0，从下一次回复开始恢复下发 cap_runs；历史累计不变。返回清零后的安装记录。
+func (s *Server) handleResetViolations(c *gin.Context) {
+	id := c.Param("install_id")
+	if !protocol.IsInstallID(id) {
+		fail(c, errNotFound)
+		return
+	}
+	ctx, cancel := context.WithTimeout(c.Request.Context(), queryTimeout)
+	defer cancel()
+	db := s.db.WithContext(ctx)
+	before, err := installDetail(db, id) // 不存在返回404
+	if err != nil {
+		s.failErr(c, err)
+		return
+	}
+	if _, err := s.violations.Reset(ctx, id, user(c)); err != nil {
+		s.failErr(c, err)
+		return
+	}
+	after, err := installDetail(db, id)
+	if err != nil {
+		s.failErr(c, err)
+		return
+	}
+	s.log.Info("violations reset", "user", user(c), "install_id", id, "before", before.Violations.Count,
+		"limit", before.Violations.Limit, "was_stopped", before.Violations.Stopped)
+	c.JSON(http.StatusOK, after)
 }
 
 // toReport 把明文里的counters和measurements解析出来，列表里直接展示上报内容。

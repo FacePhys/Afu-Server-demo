@@ -26,7 +26,7 @@ func (b KeyBilling) HasQuota(ctx context.Context, appKey string) (bool, error) {
 }
 
 // Charge 先锁住这个 App Key 的行，再扣余额、记流水。同一个 App Key 的扣费在这里串行，
-// 加锁顺序固定为「安装记录 → App Key」，不会互相死锁。
+// 加锁顺序固定为「安装记录 → 违规记录 → App Key」，不会互相死锁。
 func (b KeyBilling) Charge(ctx context.Context, tx *gorm.DB, req ChargeRequest) (ChargeResult, error) {
 	var k store.AppKey
 	if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).Where("app_key = ?", req.AppKey).Take(&k).Error; err != nil {

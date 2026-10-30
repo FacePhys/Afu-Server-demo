@@ -104,9 +104,9 @@ func (r *ReportReq) Validate() error {
 	if len(r.Measurements) > MaxMeasurements {
 		return fmt.Errorf("%w: measurements %d, max %d", errInvalid, len(r.Measurements), MaxMeasurements)
 	}
-	for i, m := range r.Measurements {
-		if m.No < 1 || m.EndTS < m.StartTS {
-			return fmt.Errorf("%w: measurements[%d] no=%d start_ts=%d end_ts=%d", errInvalid, i, m.No, m.StartTS, m.EndTS)
+	for i, m := range r.Measurements { // start_ts > end_ts 不拒绝：照常扣费、记一次违规，见 internal/violation
+		if m.No < 1 {
+			return fmt.Errorf("%w: measurements[%d] no=%d", errInvalid, i, m.No)
 		}
 	}
 	return nil

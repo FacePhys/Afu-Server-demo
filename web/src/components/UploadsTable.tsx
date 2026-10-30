@@ -19,7 +19,7 @@ function ClientTime({ ms }: { ms: number }) {
   )
 }
 
-/** 本次上报带的计次记录：每条一行，悬停看客户端起止时间；空上报标灰 */
+/** 本次上报带的计次记录：每条一行，悬停看客户端起止时间；空上报标灰，起止时间颠倒(违规)标红 */
 function ReportedMeasurements({ items }: { items: ReportedMeasurement[] }) {
   if (!items.length) return <Tag>空上报</Tag>
   return (
@@ -30,6 +30,7 @@ function ReportedMeasurements({ items }: { items: ReportedMeasurement[] }) {
             <span>#{m.no}</span>
             <span>{fmtNum(m.frames)}帧</span>
             <DurationText ms={m.dt_ms} />
+            {m.start_ts > m.end_ts && <Tag color="red">起止时间颠倒</Tag>}
           </Flex>
         </Tooltip>
       ))}

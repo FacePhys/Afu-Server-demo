@@ -1,4 +1,5 @@
 import { App, Button, Flex, Tag, Typography } from 'antd'
+import type { Violations } from '../api/types'
 import { RESET_REASON_LABEL, SHORT_DT_MS, fmtDuration } from '../utils/format'
 
 /** install_id：等宽字体 + 复制 */
@@ -38,6 +39,17 @@ export function JsonView({ value }: { value: unknown }) {
       <pre style={{ margin: 0, padding: 12, background: '#fafafa', borderRadius: 6, overflow: 'auto', fontSize: 12 }}>
         {text}
       </pre>
+    </Flex>
+  )
+}
+
+/** 违规次数：当前次数 / 上限，停发时标红；没有违规显示 - */
+export function ViolationsText({ v }: { v: Violations }) {
+  if (!v.count && !v.total) return <span>-</span>
+  return (
+    <Flex gap={4} align="center" style={{ whiteSpace: 'nowrap' }}>
+      <span>{v.limit ? `${v.count} / ${v.limit}` : v.count}</span>
+      {v.stopped && <Tag color="red">已停发</Tag>}
     </Flex>
   )
 }

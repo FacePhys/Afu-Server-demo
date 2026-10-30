@@ -31,6 +31,7 @@ interface ConfigForm {
   unit_price?: number | null
   overdraft_limit?: number | null
   offline_runs?: number | null
+  max_violations?: number | null
 }
 
 interface CreateForm extends ConfigForm {
@@ -53,7 +54,7 @@ const BILLING_TAG: Record<AppKey['billing_state'], { color?: string; text: strin
 
 const yuanInput = { min: 0, precision: 4, style: { width: '100%' }, suffix: '元' }
 
-/** 单价、透支额度、离线可用次数，创建和修改配置共用 */
+/** 单价、透支额度、离线可用次数、违规上限，创建和修改配置共用 */
 function ConfigFields() {
   return (
     <>
@@ -74,6 +75,14 @@ function ConfigFields() {
         rules={[{ required: true, message: '请填写离线可用次数' }]}
       >
         <InputNumber min={0} max={16} precision={0} style={{ width: '100%' }} suffix="次" />
+      </Form.Item>
+      <Form.Item
+        name="max_violations"
+        label="违规上限"
+        extra="设备上报的计次记录起始时间晚于结束时间(start_ts > end_ts)算一次违规，照常扣费；一台设备的违规次数达到上限后，给它的回复 cap_runs 为 0(停发)，在「安装」详情里清零后恢复。填 0 表示不限(只计数、不停发)，最大 1000。"
+        rules={[{ required: true, message: '请填写违规上限' }]}
+      >
+        <InputNumber min={0} max={1000} precision={0} style={{ width: '100%' }} suffix="次" />
       </Form.Item>
     </>
   )
@@ -165,6 +174,7 @@ export default function AppKeys() {
           initial_balance: yuanToUnits(v.initial_balance),
           overdraft_limit: yuanToUnits(v.overdraft_limit),
           offline_runs: v.offline_runs ?? 0,
+          max_violations: v.max_violations ?? 0,
         })
         return `已创建 ${k.app_key}`
       },
@@ -182,6 +192,7 @@ export default function AppKeys() {
           unit_price: yuanToUnits(v.unit_price),
           overdraft_limit: yuanToUnits(v.overdraft_limit),
           offline_runs: v.offline_runs ?? 0,
+          max_violations: v.max_violations ?? 0,
         })
         return '配置已修改'
       },
@@ -233,6 +244,7 @@ export default function AppKeys() {
     { title: '透支额度(元)', dataIndex: 'overdraft_limit', align: 'right', render: fmtYuan },
     { title: '计费次数', dataIndex: 'used_count', align: 'right', render: fmtNum },
     { title: '离线次数', dataIndex: 'offline_runs', align: 'right', render: fmtNum },
+    { title: '违规上限', dataIndex: 'max_violations', align: 'right', render: (v: number) => (v ? fmtNum(v) : '不限') },
     {
       title: '计费',
       dataIndex: 'billing_state',
@@ -264,6 +276,7 @@ export default function AppKeys() {
                 unit_price: k.unit_price ? unitsToYuan(k.unit_price) : null,
                 overdraft_limit: unitsToYuan(k.overdraft_limit),
                 offline_runs: k.offline_runs,
+                max_violations: k.max_violations,
               })
               setEditing(k)
             }}
@@ -325,7 +338,7 @@ export default function AppKeys() {
         onCancel={() => setCreating(false)}
         destroyOnHidden
       >
-        <Form<CreateForm> form={createForm} layout="vertical" onFinish={create} initialValues={{ offline_runs: 5 }}>
+        <Form<CreateForm> form={createForm} layout="vertical" onFinish={create} initialValues={{ offline_runs: 5, max_violations: 3 }}>
           <Form.Item name="remark" label="备注" rules={[{ max: 255, message: '最多255个字' }]}>
             <Input placeholder="例如：阿福正式环境" />
           </Form.Item>
@@ -358,7 +371,7 @@ export default function AppKeys() {
           type="info"
           showIcon
           style={{ marginBottom: 16 }}
-          title="新单价从下一次上报开始扣费；新的离线可用次数在下一次回复(ack / refused)里下发；余额只能通过充值和扣费变化。"
+          title="新单价从下一次上报开始扣费；新的离线可用次数、违规上限从下一次回复(ack / refused)开始生效；余额只能通过充值和扣费变化。"
         />
         <Form<ConfigForm> form={configForm} layout="vertical" onFinish={updateConfig}>
           <ConfigFields />

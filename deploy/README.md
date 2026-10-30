@@ -5,7 +5,7 @@
 | 文件                                         | 说明                                                     |
 | -------------------------------------------- | -------------------------------------------------------- |
 | `afu-server-<版本>-linux-amd64.image.tar.gz` | 服务镜像(前端已内置)，用 `docker load` 加载              |
-| `docker-compose.yml`                         | afu 服务 + MySQL 8.4                                     |
+| `docker-compose.yml`                         | afu 服务 + MySQL 8.4(Redis 用宿主机上已有的，见「Redis」) |
 | `.env.example`                               | 版本号、数据库密码、端口                                 |
 | `config.yaml.example`                        | 服务配置模板                                             |
 | `migrations/*.sql`                           | 建表SQL，MySQL首次启动(数据卷为空)时按文件名顺序自动执行 |
@@ -95,6 +95,30 @@
    各步都打印出 ack / refused 即正常。
 
 10. HTTPS：参照 `nginx.conf.example` 配好nginx，客户端地址为 `https://<域名>/afu/v1/meter`。
+11. Redis(可选)：违规次数的缓存，用宿主机上的 Redis，按下面「Redis」配置；不配置时直接查库，功能一样。
+
+## Redis
+
+违规次数(计次记录起始时间晚于结束时间，按设备累计，达到 App Key 的违规上限后停发)存在 MySQL 的 `install_violations` 表，Redis 只做缓存：服务启动时把违规记录全量同步进 Redis，之后先写 MySQL 再写 Redis；Redis 不通、重启、被清空时服务自动改查库，10秒内自动重建，不影响上报。设计见 `docs/development.md`「违规计数」。
+
+用宿主机上已经装好的 Redis，和其他服务共用，key 都带 `afu:` 前缀(配置项 `redis.key_prefix`)：
+
+1. 宿主机 Redis 默认只监听 `127.0.0.1`，容器连不到。让它再监听 docker0 的地址 `172.17.0.1`(容器里用 `host.docker.internal` 访问，compose 已配好)。先打开 `ip_nonlocal_bind`：开机时 Redis 可能比 Docker 先启动，那时 docker0 还没建好，不打开的话 Redis 会因为绑不上地址起不来。
+
+   ```bash
+   ip -4 addr show docker0 | grep inet          # 确认是 172.17.0.1
+   echo 'net.ipv4.ip_nonlocal_bind = 1' | sudo tee /etc/sysctl.d/99-redis-bind.conf && sudo sysctl --system
+   sudo cp /etc/redis/redis.conf /etc/redis/redis.conf.bak-$(date +%F)
+   sudo sed -i 's/^bind 127.0.0.1 ::1$/bind 127.0.0.1 ::1 172.17.0.1/' /etc/redis/redis.conf && grep '^bind' /etc/redis/redis.conf
+   sudo systemctl restart redis-server          # 共用这个 Redis 的服务会断开约1秒后自动重连
+   ```
+
+   宿主机上所有容器都能连到 `172.17.0.1:6379`，Redis 一定要设密码(`requirepass`)。
+
+2. `.env` 里填 `AFU_REDIS_ADDR=host.docker.internal:6379`，`AFU_REDIS_PASSWORD` 填 `/etc/redis/redis.conf` 里 `requirepass` 的值，然后 `sudo docker compose up -d afu`。
+3. 检查：`sudo docker compose logs afu | grep violation_cache` 能看到 `violation cache loaded`；看到 `violation cache initial load failed` 说明连不上，服务照常运行(查库)，查地址和密码。
+
+不用 Redis：`AFU_REDIS_ADDR` 留空即可。
 
 ## 升级
 
@@ -104,8 +128,9 @@
 4. 有新的迁移文件时，先在数据库里按文件名顺序执行新增的文件(已有数据的库不会自动执行；每个文件只执行一次)：
 
    ```bash
-   # 例：从 794de2f 升级需要执行 002 ~ 005；从 4decc97 升级执行 003 ~ 005；从 e312b7d 升级执行 004、005
-   for f in migrations/002_app_keys.sql migrations/003_billing.sql migrations/004_offline_runs.sql migrations/005_report_deltas.sql; do
+   # 从 794de2f 升级需要执行 002 ~ 006；从 4decc97 升级执行 003 ~ 006；从 e312b7d 升级执行 004 ~ 006；从 48fab20 ~ 4183e5c 升级只执行 006
+   # 下面是只执行 006 的写法，更早的版本把要执行的文件按顺序都列上
+   for f in migrations/006_violations.sql; do
      sudo docker compose exec -T mysql sh -c 'mysql -uroot -p"$MYSQL_ROOT_PASSWORD" afu' < "$f"
    done
    ```
@@ -116,6 +141,8 @@
    1. 执行 `004_offline_runs.sql` 后已有 App Key 的离线可用次数都是5；执行 `005_report_deltas.sql` 会按旧数据补算每份上报的增量，后台按天统计和升级前一致。
    2. 改 `/opt/afu/config.yaml`：`meter.ttl_sec` 改成 `0`(额度不限时)；`per_measure_frames`、`per_measure_runs` 不再使用，可以删掉(留着不影响启动)。改完后第5步重建服务时生效。
    3. 这一版改了计费单位(40秒窗口测满5秒计1次)、回复多了 acked_sessions、cap_runs 改为「从 acked_sessions 往后还能新增几次」、cap_frames 固定为0，客户端 SDK 要和服务端一起切换。
+
+   从 4183e5c 及更早的版本升级时：执行 `006_violations.sql` 后已有 App Key 的违规上限都是3(0为不限，在后台「修改配置」里改)；要用 Redis 缓存的话先按「Redis」配置，并用新包里的 `docker-compose.yml` 覆盖(多了 Redis 的环境变量和 `host.docker.internal`)。这一版起，计次记录起始时间晚于结束时间不再返回 bad_payload，照常扣费并记一次违规。
 5. 只重建服务，数据库不动：
 
    ```bash
@@ -148,7 +175,8 @@
 | 停止全部       | `sudo docker compose down`(数据在卷里，不会丢；不要加 `-v`)                                                           |
 | 备份数据库     | 见下方命令                                                                                                            |
 | 新增后台用户   | `./gen-admin-token.sh`，填进 `config.yaml` 后 `sudo docker compose restart afu`                                       |
-| 充值、修改配置 | 后台「App Key」页「充值」「修改配置」(单价、透支额度、离线可用次数)；停发后充值即可恢复；每笔扣费、充值在「流水」里查 |
+| 充值、修改配置 | 后台「App Key」页「充值」「修改配置」(单价、透支额度、离线可用次数、违规上限)；停发后充值即可恢复；每笔扣费、充值在「流水」里查 |
+| 违规清零       | 后台「安装」页按「违规已停发」筛选，进详情点「清零」；清零后从下一次回复开始恢复下发                                  |
 
 备份数据库：
 

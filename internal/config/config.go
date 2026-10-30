@@ -10,12 +10,20 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
-// EnvDSN 设置后覆盖配置文件里的 db.dsn。
-const EnvDSN = "AFU_DB_DSN"
+// 环境变量设置后覆盖配置文件里的对应项。
+const (
+	EnvDSN           = "AFU_DB_DSN"         // db.dsn
+	EnvRedisAddr     = "AFU_REDIS_ADDR"     // redis.addr
+	EnvRedisPassword = "AFU_REDIS_PASSWORD" // redis.password
+)
+
+// DefaultRedisKeyPrefix 是 redis.key_prefix 的默认值。
+const DefaultRedisKeyPrefix = "afu:"
 
 type Config struct {
 	Server ServerConfig `yaml:"server"`
 	DB     DBConfig     `yaml:"db"`
+	Redis  RedisConfig  `yaml:"redis"`
 	Keys   []KeyConfig  `yaml:"keys"`
 	Meter  MeterConfig  `yaml:"meter"`
 	Log    LogConfig    `yaml:"log"`
@@ -33,6 +41,15 @@ type DBConfig struct {
 	DSN          string `yaml:"dsn"`
 	MaxOpenConns int    `yaml:"max_open_conns"`
 	MaxIdleConns int    `yaml:"max_idle_conns"`
+}
+
+// RedisConfig 违规次数的缓存，可以和其他服务共用一个 Redis，靠 key_prefix 区分。
+// MySQL 是唯一准数据：Redis 没配置或不可用时直接查库，见 docs/development.md「违规计数」。
+type RedisConfig struct {
+	Addr      string `yaml:"addr"`       // host:port；留空不用 Redis
+	Password  string `yaml:"password"`   // 建议用环境变量，不写进配置文件
+	DB        int    `yaml:"db"`         // 库编号
+	KeyPrefix string `yaml:"key_prefix"` // 所有 key 的前缀，默认 "afu:"
 }
 
 type KeyConfig struct {
@@ -78,13 +95,16 @@ func Load(path string) (*Config, error) {
 	cfg := Config{
 		Server: ServerConfig{Addr: ":8080", MaxBodyBytes: 64 << 10, ReadTimeout: 5 * time.Second, WriteTimeout: 5 * time.Second},
 		DB:     DBConfig{MaxOpenConns: 50, MaxIdleConns: 10},
+		Redis:  RedisConfig{KeyPrefix: DefaultRedisKeyPrefix},
 		Log:    LogConfig{Level: "info"},
 	}
 	if err := yaml.Unmarshal(b, &cfg); err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if dsn := os.Getenv(EnvDSN); dsn != "" {
-		cfg.DB.DSN = dsn
+	for env, field := range map[string]*string{EnvDSN: &cfg.DB.DSN, EnvRedisAddr: &cfg.Redis.Addr, EnvRedisPassword: &cfg.Redis.Password} {
+		if v := os.Getenv(env); v != "" {
+			*field = v
+		}
 	}
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -102,6 +122,9 @@ func (c *Config) validate() error {
 	}
 	if c.Meter.TTLSec < 0 || c.Meter.ReportSec < 0 {
 		errs = append(errs, errors.New("meter.ttl_sec、meter.report_sec 不能为负数"))
+	}
+	if c.Redis.Addr != "" && (c.Redis.KeyPrefix == "" || c.Redis.DB < 0) {
+		errs = append(errs, errors.New("启用了 redis.addr，但 redis.key_prefix 为空或 redis.db 为负数"))
 	}
 	active := 0
 	for _, k := range c.Keys {

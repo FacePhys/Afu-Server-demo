@@ -89,7 +89,7 @@ func TestReportValidate(t *testing.T) {
 		{"ts为0", func(r *ReportReq) { r.TS = 0 }, false},
 		{"measurements超过上限", func(r *ReportReq) { r.Measurements = make([]Measurement, MaxMeasurements+1) }, false},
 		{"no为0", func(r *ReportReq) { r.Measurements[0].No = 0 }, false},
-		{"end_ts早于start_ts", func(r *ReportReq) { r.Measurements[0].EndTS = 5 }, false},
+		{"end_ts早于start_ts也不拒绝(记违规)", func(r *ReportReq) { r.Measurements[0].EndTS = 5 }, true},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -138,7 +138,7 @@ func TestDecodeAndValidateReason(t *testing.T) {
 		{"负数计数", []byte(`{"install_id":"` + validInstallID + `","counters":{"frames_ok":-1}}`), "frames_ok"},
 		{"计数是小数", []byte(`{"install_id":"` + validInstallID + `","measurements":[{"no":1,"dt_ms":5033.5}]}`), "5033.5"},
 		{"measurements超过上限", report(func(r *ReportReq) { r.Measurements = make([]Measurement, MaxMeasurements+1) }), "measurements 17, max 16"},
-		{"end_ts早于start_ts", report(func(r *ReportReq) { r.Measurements[0].EndTS = 5 }), "measurements[0] no=1 start_ts=10 end_ts=5"},
+		{"no为0", report(func(r *ReportReq) { r.Measurements[0].No = 0 }), "measurements[0] no=0"},
 		{"platform非法", report(func(r *ReportReq) { r.Platform = "harmony" }), `platform "harmony"`},
 		{"app_key为空", report(func(r *ReportReq) { r.AppKey = "" }), "app_key length 0"},
 		{"install_id超长只记前64字节", report(func(r *ReportReq) { r.InstallID = longID }), `install_id "` + longID[:64] + `..."`},

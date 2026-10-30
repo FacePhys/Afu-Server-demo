@@ -30,6 +30,7 @@ const (
 	maxAmount    = 100_000_000 * store.MoneyUnitsPerYuan
 
 	maxOfflineRuns = protocol.MaxMeasurements // 离线可用次数上限：离线攒下的计次要能一份上报装下
+	maxViolations  = 1000                     // 违规上限的上限，防止输错位数
 )
 
 // appKeyPattern 导入已有 App Key 时允许的格式，长度与 app_keys.app_key 列宽一致。
@@ -48,6 +49,7 @@ type AppKey struct {
 	OverdraftLimit uint64    `json:"overdraft_limit"` // 透支额度
 	UsedCount      uint64    `json:"used_count"`      // 累计计费的计次
 	OfflineRuns    uint64    `json:"offline_runs"`    // 离线可用次数，ack 的 cap_runs 直接下发
+	MaxViolations  uint64    `json:"max_violations"`  // 违规上限：设备违规次数达到后停发；0为不限
 	BillingState   string    `json:"billing_state"`   // free / normal / overdraft / exhausted
 	CreatedBy      string    `json:"created_by"`
 	CreatedAt      time.Time `json:"created_at"`
@@ -76,7 +78,7 @@ type LedgerEntry struct {
 func toAppKey(k store.AppKey) AppKey {
 	return AppKey{ID: k.ID, AppKey: k.AppKey, Remark: k.Remark, Status: k.Status,
 		UnitPrice: k.UnitPrice, Balance: k.Balance, OverdraftLimit: k.OverdraftLimit, UsedCount: k.UsedCount,
-		OfflineRuns: k.OfflineRuns, BillingState: k.BillingState(), CreatedBy: k.CreatedBy, CreatedAt: k.CreatedAt.UTC(), UpdatedAt: k.UpdatedAt.UTC()}
+		OfflineRuns: k.OfflineRuns, MaxViolations: k.MaxViolations, BillingState: k.BillingState(), CreatedBy: k.CreatedBy, CreatedAt: k.CreatedAt.UTC(), UpdatedAt: k.UpdatedAt.UTC()}
 }
 
 func toLedgerEntry(e store.LedgerEntry) LedgerEntry {
@@ -138,14 +140,18 @@ func (s *Server) handleCreateAppKey(c *gin.Context) {
 		InitialBalance uint64  `json:"initial_balance"` // 可选
 		OverdraftLimit uint64  `json:"overdraft_limit"` // 可选
 		OfflineRuns    *uint64 `json:"offline_runs"`    // 可选，不传默认5
+		MaxViolations  *uint64 `json:"max_violations"`  // 可选，不传默认3
 	}
 	if err := decodeBody(c, &req); err != nil {
 		s.failErr(c, err)
 		return
 	}
-	offlineRuns := uint64(store.DefaultOfflineRuns)
+	offlineRuns, maxViol := uint64(store.DefaultOfflineRuns), uint64(store.DefaultMaxViolations)
 	if req.OfflineRuns != nil {
 		offlineRuns = *req.OfflineRuns
+	}
+	if req.MaxViolations != nil {
+		maxViol = *req.MaxViolations
 	}
 	key := strings.TrimSpace(req.AppKey)
 	if key == "" {
@@ -156,7 +162,7 @@ func (s *Server) handleCreateAppKey(c *gin.Context) {
 	}
 	remark := strings.TrimSpace(req.Remark)
 	if !validRemark(remark) || req.UnitPrice > maxUnitPrice || req.InitialBalance > maxAmount || req.OverdraftLimit > maxAmount ||
-		offlineRuns > maxOfflineRuns {
+		offlineRuns > maxOfflineRuns || maxViol > maxViolations {
 		fail(c, errBadRequest)
 		return
 	}
@@ -164,7 +170,8 @@ func (s *Server) handleCreateAppKey(c *gin.Context) {
 	db, cancel := s.query(c)
 	defer cancel()
 	row := store.AppKey{AppKey: key, Remark: remark, Status: store.AppKeyEnabled, UnitPrice: req.UnitPrice,
-		Balance: int64(req.InitialBalance), OverdraftLimit: req.OverdraftLimit, OfflineRuns: offlineRuns, CreatedBy: user(c)}
+		Balance: int64(req.InitialBalance), OverdraftLimit: req.OverdraftLimit, OfflineRuns: offlineRuns, MaxViolations: maxViol,
+		CreatedBy: user(c)}
 	err := db.Transaction(func(tx *gorm.DB) error {
 		if err := tx.Create(&row).Error; err != nil {
 			return err
@@ -188,11 +195,11 @@ func (s *Server) handleCreateAppKey(c *gin.Context) {
 	}
 	s.log.Info("app_key created", "user", user(c), "id", row.ID, "app_key", row.AppKey, "imported", req.AppKey != "",
 		"unit_price", row.UnitPrice, "initial_balance", req.InitialBalance, "overdraft_limit", row.OverdraftLimit,
-		"offline_runs", row.OfflineRuns)
+		"offline_runs", row.OfflineRuns, "max_violations", row.MaxViolations)
 	c.JSON(http.StatusCreated, toAppKey(row))
 }
 
-// handleUpdateAppKey 修改状态(启用 / 停用)、备注、单价、透支额度、离线可用次数；不提供删除，停用即可。
+// handleUpdateAppKey 修改状态(启用 / 停用)、备注、单价、透支额度、离线可用次数、违规上限；不提供删除，停用即可。
 // 余额只能通过充值和上报扣费变化，保证和流水对得上。
 func (s *Server) handleUpdateAppKey(c *gin.Context) {
 	id, ok := appKeyID(c)
@@ -206,6 +213,7 @@ func (s *Server) handleUpdateAppKey(c *gin.Context) {
 		UnitPrice      *uint64 `json:"unit_price"`
 		OverdraftLimit *uint64 `json:"overdraft_limit"`
 		OfflineRuns    *uint64 `json:"offline_runs"`
+		MaxViolations  *uint64 `json:"max_violations"`
 	}
 	if err := decodeBody(c, &req); err != nil {
 		s.failErr(c, err)
@@ -248,6 +256,13 @@ func (s *Server) handleUpdateAppKey(c *gin.Context) {
 		}
 		updates["offline_runs"] = *req.OfflineRuns
 	}
+	if req.MaxViolations != nil {
+		if *req.MaxViolations > maxViolations {
+			fail(c, errBadRequest)
+			return
+		}
+		updates["max_violations"] = *req.MaxViolations
+	}
 	if len(updates) == 0 {
 		fail(c, errBadRequest)
 		return
@@ -269,7 +284,8 @@ func (s *Server) handleUpdateAppKey(c *gin.Context) {
 		return
 	}
 	s.log.Info("app_key updated", "user", user(c), "id", id, "app_key", row.AppKey, "status", row.Status,
-		"unit_price", row.UnitPrice, "overdraft_limit", row.OverdraftLimit, "offline_runs", row.OfflineRuns)
+		"unit_price", row.UnitPrice, "overdraft_limit", row.OverdraftLimit, "offline_runs", row.OfflineRuns,
+		"max_violations", row.MaxViolations)
 	c.JSON(http.StatusOK, toAppKey(row))
 }
 

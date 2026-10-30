@@ -6,7 +6,7 @@ import type { Dayjs } from 'dayjs'
 import { apiGet, type Params } from '../api/client'
 import type { Install, Page } from '../api/types'
 import PagedTable from '../components/PagedTable'
-import { IdText, ResetReasonTag } from '../components/Common'
+import { IdText, ResetReasonTag, ViolationsText } from '../components/Common'
 import { RESET_REASON_OPTIONS, fmtDuration, fmtNum } from '../utils/format'
 import { fmtTime, rangeParams } from '../utils/time'
 
@@ -14,8 +14,14 @@ interface FilterForm {
   install_id?: string
   platform?: string
   reset_reason?: string
+  violation?: string
   created?: [Dayjs, Dayjs]
 }
+
+const VIOLATION_OPTIONS = [
+  { value: 'any', label: '有违规(未清零)' },
+  { value: 'stopped', label: '违规已停发' },
+]
 
 export default function Installs() {
   const navigate = useNavigate()
@@ -41,6 +47,7 @@ export default function Installs() {
     { title: '已确认seq', dataIndex: 'confirmed_seq', align: 'right' },
     { title: '累计计次', key: 'sessions', align: 'right', render: (_, r) => fmtNum(r.counters.sessions) },
     { title: '测量时长', key: 'dt_ms', align: 'right', render: (_, r) => fmtDuration(r.counters.dt_ms) },
+    { title: '违规(次数 / 上限)', key: 'violations', render: (_, r) => <ViolationsText v={r.violations} /> },
     { title: '创建时间', dataIndex: 'created_at', render: fmtTime },
     {
       title: '操作',
@@ -86,6 +93,9 @@ export default function Installs() {
         </Form.Item>
         <Form.Item name="reset_reason">
           <Select placeholder="新安装原因" allowClear style={{ width: 140 }} options={RESET_REASON_OPTIONS} />
+        </Form.Item>
+        <Form.Item name="violation">
+          <Select placeholder="违规" allowClear style={{ width: 150 }} options={VIOLATION_OPTIONS} />
         </Form.Item>
         <Form.Item name="created">
           <DatePicker.RangePicker showTime placeholder={['创建时间起', '创建时间止']} />

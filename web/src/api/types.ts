@@ -61,8 +61,22 @@ export interface Install {
   reset_reason: string
   confirmed_seq: number
   counters: Counters
+  violations: Violations
   created_at: string
   updated_at: string
+}
+
+/** 设备的违规情况：计次记录 start_ts > end_ts 算一次违规，达到 App Key 的违规上限后停发(cap_runs 为0) */
+export interface Violations {
+  count: number // 当前违规次数，清零后重新累计
+  total: number // 历史累计，清零不变
+  limit: number // 安装记录的 App Key 的违规上限，0为不限
+  stopped: boolean // 达到上限，回复的 cap_runs 为0
+  last_seq: number
+  last_no: number
+  last_at: string | null
+  reset_by: string
+  reset_at: string | null
 }
 
 /** 上报明文里的一条计次记录 */
@@ -97,6 +111,7 @@ export interface AppKey {
   overdraft_limit: number // 透支额度
   used_count: number // 累计计费的计次
   offline_runs: number // 离线可用次数：从已确认往后还能新增几次计次，cap_runs 直接下发
+  max_violations: number // 违规上限：设备违规次数达到后停发；0为不限
   billing_state: 'free' | 'normal' | 'overdraft' | 'exhausted'
   created_by: string
   created_at: string
