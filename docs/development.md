@@ -315,6 +315,7 @@ type Refused struct {
 1. 计数类字段是 `uint64`，传负数会在json解析时失败，同样返回bad_payload。
 2. 明文里出现未知字段不报错，方便客户端先加字段。
 3. `measurements[].dt_ms ≤ 5000` 不拒绝，只记录异常日志；拒绝会让客户端一直重试同一份上报。
+4. 不通过时记一条 `bad payload` WARN 日志：type、kid、install_id(格式正确时，访问日志里也带上)、seq，reason 是具体原因，例如 `invalid payload: measurements[0] no=3 start_ts=2000 end_ts=1000`，json 解析失败时是 json 的报错(带字段路径)。不记明文，客户端传来的字符串截断到64字节、整条原因截断到256字节；客户端仍只收到 bad_payload。
 
 ### 错误码
 

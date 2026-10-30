@@ -82,7 +82,7 @@ func (h *Handler) Meter(c *gin.Context) {
 	case protocol.TypeRegister:
 		var req protocol.RegisterReq
 		if err := protocol.DecodeAndValidate(plain, &req); err != nil {
-			h.fail(c, err)
+			h.badPayload(c, req.InstallID, 0, err)
 			return
 		}
 		f.installID = req.InstallID
@@ -90,7 +90,7 @@ func (h *Handler) Meter(c *gin.Context) {
 	case protocol.TypeReport:
 		var req protocol.ReportReq
 		if err := protocol.DecodeAndValidate(plain, &req); err != nil {
-			h.fail(c, err)
+			h.badPayload(c, req.InstallID, req.Seq, err)
 			return
 		}
 		f.installID, f.seq = req.InstallID, req.Seq
@@ -113,6 +113,18 @@ func (h *Handler) Meter(c *gin.Context) {
 	}
 	f.result = respType
 	c.JSON(http.StatusOK, protocol.RespEnvelope{V: *env.V, Type: respType, CT: ct})
+}
+
+// badPayload 明文不合法：具体原因(哪个字段、取值，不含明文)记一条 WARN 日志，客户端照常只收到 bad_payload。
+// install_id 格式正确时也写进访问日志，方便找到是哪台设备；格式不对的编号在原因里。
+func (h *Handler) badPayload(c *gin.Context, installID string, seq uint64, err error) {
+	f := fields(c)
+	if protocol.IsInstallID(installID) {
+		f.installID = installID
+	}
+	f.seq = seq
+	h.log.Warn("bad payload", "type", f.typ, "kid", f.kid, "install_id", f.installID, "seq", f.seq, "reason", err.Error())
+	h.fail(c, err)
 }
 
 // fail 返回明文错误；非 *protocol.Error 的详细原因只写日志，不返回给客户端。

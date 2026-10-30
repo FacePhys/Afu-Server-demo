@@ -130,6 +130,44 @@ func TestErrors(t *testing.T) {
 	}
 }
 
+// 明文不合法：原因和 install_id 写进日志，客户端只收到固定的 bad_payload，日志里没有明文。
+func TestBadPayloadLogsReason(t *testing.T) {
+	k := key(t)
+	var logs bytes.Buffer
+	gin.SetMode(gin.TestMode)
+	r := New(&fakeService{}, keys{1: k}, 64<<10, slog.New(slog.NewJSONHandler(&logs, nil))).Router()
+
+	plain := []byte(`{"install_id":"` + installID + `","app_key":"a","app_id":"b","platform":"ios","seq":7,"ts":1,"sdk":"1",` +
+		`"measurements":[{"no":3,"start_ts":2000,"end_ts":1000,"frames":151,"dt_ms":5033}]}`)
+	ct, _, _ := envelope.SealRequest(&k.PublicKey, 1, 1, protocol.TypeReport, plain)
+	w := do(t, r, envelopeJSON(t, 1, 1, protocol.TypeReport, ct))
+	var body map[string]string
+	json.Unmarshal(w.Body.Bytes(), &body)
+	if w.Code != http.StatusBadRequest || body["code"] != "bad_payload" || body["msg"] != "bad payload" {
+		t.Fatalf("status = %d, body = %s", w.Code, w.Body)
+	}
+
+	byMsg := map[string]map[string]any{}
+	for _, line := range strings.Split(strings.TrimSpace(logs.String()), "\n") {
+		var m map[string]any
+		if err := json.Unmarshal([]byte(line), &m); err != nil {
+			t.Fatalf("日志不是json: %s", line)
+		}
+		byMsg[m["msg"].(string)] = m
+	}
+	warn, access := byMsg["bad payload"], byMsg["request"]
+	if warn["level"] != "WARN" || warn["type"] != protocol.TypeReport || warn["install_id"] != installID || warn["seq"] != float64(7) ||
+		warn["reason"] != "invalid payload: measurements[0] no=3 start_ts=2000 end_ts=1000" {
+		t.Fatalf("WARN日志 = %v", warn)
+	}
+	if access["result"] != "bad_payload" || access["install_id"] != installID || access["seq"] != float64(7) {
+		t.Fatalf("访问日志 = %v", access)
+	}
+	if strings.Contains(logs.String(), "frames") {
+		t.Fatalf("日志里不能有明文: %s", logs.String())
+	}
+}
+
 func TestSuccessResponseIsEncrypted(t *testing.T) {
 	k := key(t)
 	want := protocol.Ack{InstallID: installID, Seq: 0, AckedSessions: 0, CapFrames: 0, CapRuns: 5, TTLSec: 0, ReportSec: 60}
