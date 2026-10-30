@@ -15,13 +15,16 @@ interface FilterForm {
 // Uploads 上传记录：每行一次上传，本次计次和累计计数直接展示。
 export default function Uploads() {
   const [filters, setFilters] = useState<Params>({})
+  const [runs, setRuns] = useState(0) // 每点一次查询加1，表格重新挂载：条件没变也从第一页拿最新数据
 
-  const onFinish = ({ range, install_id, short_only }: FilterForm) =>
+  const onFinish = ({ range, install_id, short_only }: FilterForm) => {
     setFilters({
       install_id: install_id?.trim(),
       max_dt_ms: short_only ? SHORT_DT_MS : undefined,
       ...rangeParams(range),
     })
+    setRuns((n) => n + 1)
+  }
 
   return (
     <Flex vertical gap={16}>
@@ -39,7 +42,7 @@ export default function Uploads() {
           查询
         </Button>
       </Form>
-      <UploadsTable key={JSON.stringify(filters)} filters={filters} />
+      <UploadsTable key={runs} filters={filters} />
     </Flex>
   )
 }

@@ -320,14 +320,14 @@ func (s *Server) handleRechargeAppKey(c *gin.Context) {
 	c.JSON(http.StatusOK, toAppKey(row))
 }
 
-// handleAppKeyLedger 计费流水，按id倒序游标分页。
+// handleAppKeyLedger 计费流水，按id倒序分页。
 func (s *Server) handleAppKeyLedger(c *gin.Context) {
 	id, ok := appKeyID(c)
 	if !ok {
 		fail(c, errNotFound)
 		return
 	}
-	cursor, limit, err := parsePage(c)
+	p, err := parsePage(c)
 	if err != nil {
 		s.failErr(c, err)
 		return
@@ -339,15 +339,15 @@ func (s *Server) handleAppKeyLedger(c *gin.Context) {
 		s.failErr(c, err)
 		return
 	}
-	q := db.Where("app_key = ?", k.AppKey)
-	if cursor > 0 {
-		q = q.Where("id < ?", cursor)
-	}
-	var rows []store.LedgerEntry
-	if err := q.Order("id DESC").Limit(limit + 1).Find(&rows).Error; err != nil {
+	q, total, err := countPage(db, db.Model(&store.LedgerEntry{}).Where("app_key = ?", k.AppKey), "billing_ledger", "id", &p)
+	if err != nil {
 		s.failErr(c, err)
 		return
 	}
-	page := paginate(rows, limit, func(e store.LedgerEntry) uint64 { return e.ID })
-	c.JSON(http.StatusOK, mapPage(page, toLedgerEntry))
+	var rows []store.LedgerEntry
+	if err := q.Order("id DESC").Offset(p.offset()).Limit(p.size).Find(&rows).Error; err != nil {
+		s.failErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, newPage(rows, p, total, toLedgerEntry))
 }

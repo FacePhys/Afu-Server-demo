@@ -21,7 +21,7 @@ import { Link } from 'react-router'
 import { apiGet, apiSend, errorText } from '../api/client'
 import type { AppKey, AppKeyList, LedgerEntry, Page } from '../api/types'
 import { useApi } from '../api/useApi'
-import CursorTable from '../components/CursorTable'
+import PagedTable from '../components/PagedTable'
 import { IdText } from '../components/Common'
 import { fmtNum } from '../utils/format'
 import { fmtYuan, unitsToYuan, yuanToUnits } from '../utils/money'
@@ -119,10 +119,10 @@ function LedgerDrawer({ k, onClose }: { k: AppKey; onClose: () => void }) {
   ]
   return (
     <Drawer open title={`计费流水 ${k.app_key}`} size={900} onClose={onClose} destroyOnHidden>
-      <CursorTable<LedgerEntry>
+      <PagedTable<LedgerEntry>
         rowKey={(e) => String(e.id)}
         columns={columns}
-        fetchPage={(cursor) => apiGet<Page<LedgerEntry>>(`/app-keys/${k.id}/ledger`, { cursor })}
+        fetchPage={(page) => apiGet<Page<LedgerEntry>>(`/app-keys/${k.id}/ledger`, page)}
       />
     </Drawer>
   )

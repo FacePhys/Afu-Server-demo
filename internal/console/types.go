@@ -8,9 +8,14 @@ import (
 	"github.com/FacePhys/Afu-Server-demo/internal/protocol"
 )
 
+// Page 列表的一页，按id倒序(新的在前)。
 type Page[T any] struct {
-	Items      []T    `json:"items"`
-	NextCursor string `json:"next_cursor"` // 没有下一页时为空字符串
+	Items       []T    `json:"items"`
+	Page        int    `json:"page"`
+	PageSize    int    `json:"page_size"`
+	Total       int64  `json:"total"`        // 最多数到 maxCountRows
+	TotalCapped bool   `json:"total_capped"` // 实际比 total 多，只能翻看最近 total 条
+	MaxID       uint64 `json:"max_id"`       // 本次用的快照，翻页时原样带上
 }
 
 type Me struct {

@@ -175,7 +175,7 @@ func toInstall(r store.Install) Install {
 }
 
 func (s *Server) handleInstalls(c *gin.Context) {
-	cursor, limit, err := parsePage(c)
+	p, err := parsePage(c)
 	if err != nil {
 		s.failErr(c, err)
 		return
@@ -212,17 +212,18 @@ func (s *Server) handleInstalls(c *gin.Context) {
 		q = q.Where("reset_reason = ?", reason)
 	}
 	q = timeRange(q, "created_at", from, to)
-	if cursor > 0 {
-		q = q.Where("id < ?", cursor)
-	}
-
-	var rows []store.Install
-	if err := q.Order("id DESC").Limit(limit + 1).Find(&rows).Error; err != nil {
+	q, total, err := countPage(db, q, "installs", "id", &p)
+	if err != nil {
 		s.failErr(c, err)
 		return
 	}
-	page := paginate(rows, limit, func(r store.Install) uint64 { return r.ID })
-	c.JSON(http.StatusOK, mapPage(page, toInstall))
+
+	var rows []store.Install
+	if err := q.Order("id DESC").Offset(p.offset()).Limit(p.size).Find(&rows).Error; err != nil {
+		s.failErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, newPage(rows, p, total, toInstall))
 }
 
 func (s *Server) handleInstall(c *gin.Context) {
@@ -258,7 +259,7 @@ func (s *Server) toReport(r store.Report) Report {
 }
 
 func (s *Server) handleReports(c *gin.Context) {
-	cursor, limit, err := parsePage(c)
+	p, err := parsePage(c)
 	if err != nil {
 		s.failErr(c, err)
 		return
@@ -271,11 +272,7 @@ func (s *Server) handleReports(c *gin.Context) {
 	db, cancel := s.query(c)
 	defer cancel()
 
-	// 每行是一次上传：返回解析后的counters和measurements，不返回原始明文
-	// 本次扣费从计费流水取：一份上报最多一条扣费流水(install_id + seq)
-	q := db.Table("reports AS r").
-		Select("r.id, r.install_id, r.seq, r.client_ts, r.payload, r.received_at, COALESCE(-l.amount, 0) AS charge").
-		Joins("LEFT JOIN billing_ledger AS l ON l.install_id = r.install_id AND l.seq = r.seq AND l.kind = ?", store.LedgerConsume)
+	q := db.Table("reports AS r")
 	if v := c.Query("install_id"); v != "" {
 		q = q.Where("r.install_id = ?", v)
 	}
@@ -288,16 +285,22 @@ func (s *Server) handleReports(c *gin.Context) {
 		q = q.Where("EXISTS (SELECT 1 FROM measurements AS m WHERE m.install_id = r.install_id AND m.seq = r.seq AND m.dt_ms <= ?)", maxDt)
 	}
 	q = timeRange(q, "r.received_at", from, to)
-	if cursor > 0 {
-		q = q.Where("r.id < ?", cursor)
-	}
-	var rows []reportRow
-	if err := q.Order("r.id DESC").Limit(limit + 1).Scan(&rows).Error; err != nil {
+	q, total, err := countPage(db, q, "reports", "r.id", &p)
+	if err != nil {
 		s.failErr(c, err)
 		return
 	}
-	page := paginate(rows, limit, func(r reportRow) uint64 { return r.ID })
-	c.JSON(http.StatusOK, mapPage(page, func(r reportRow) Report {
+
+	// 每行是一次上传：返回解析后的counters和measurements，不返回原始明文
+	// 本次扣费从计费流水取：一份上报最多一条扣费流水(install_id + seq)
+	var rows []reportRow
+	if err := q.Select("r.id, r.install_id, r.seq, r.client_ts, r.payload, r.received_at, COALESCE(-l.amount, 0) AS charge").
+		Joins("LEFT JOIN billing_ledger AS l ON l.install_id = r.install_id AND l.seq = r.seq AND l.kind = ?", store.LedgerConsume).
+		Order("r.id DESC").Offset(p.offset()).Limit(p.size).Scan(&rows).Error; err != nil {
+		s.failErr(c, err)
+		return
+	}
+	c.JSON(http.StatusOK, newPage(rows, p, total, func(r reportRow) Report {
 		out := s.toReport(r.Report)
 		out.Charge = r.Charge
 		return out
@@ -339,12 +342,18 @@ func timeRange(q *gorm.DB, col string, from, to time.Time) *gorm.DB {
 	return q
 }
 
-func mapPage[A, B any](p Page[A], f func(A) B) Page[B] {
-	out := Page[B]{Items: make([]B, 0, len(p.Items)), NextCursor: p.NextCursor}
-	for _, it := range p.Items {
-		out.Items = append(out.Items, f(it))
+// countPage 给按id倒序分页的列表定快照、数总数：没带快照时取 table 当前最大的id。
+// 返回加上 id ≤ 快照、可以复用的查询，和最多 maxCountRows+1 的总数(多数1条用来判断「超过」)。
+func countPage(db, q *gorm.DB, table, idCol string, p *pageQuery) (*gorm.DB, int64, error) {
+	if p.maxID == 0 {
+		if err := db.Table(table).Select("COALESCE(MAX(id), 0)").Scan(&p.maxID).Error; err != nil {
+			return nil, 0, err
+		}
 	}
-	return out
+	q = q.Where(idCol+" <= ?", p.maxID).Session(&gorm.Session{})
+	var total int64
+	err := db.Table("(?) AS t", q.Select(idCol).Limit(maxCountRows+1)).Count(&total).Error
+	return q, total, err
 }
 
 func firstErr(errs ...error) error {

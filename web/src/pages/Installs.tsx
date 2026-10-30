@@ -5,7 +5,7 @@ import { useNavigate } from 'react-router'
 import type { Dayjs } from 'dayjs'
 import { apiGet, type Params } from '../api/client'
 import type { Install, Page } from '../api/types'
-import CursorTable from '../components/CursorTable'
+import PagedTable from '../components/PagedTable'
 import { IdText, ResetReasonTag } from '../components/Common'
 import { RESET_REASON_OPTIONS, fmtDuration, fmtNum } from '../utils/format'
 import { fmtTime, rangeParams } from '../utils/time'
@@ -20,6 +20,7 @@ interface FilterForm {
 export default function Installs() {
   const navigate = useNavigate()
   const [filters, setFilters] = useState<Params>({})
+  const [runs, setRuns] = useState(0) // 每点一次查询加1，表格重新挂载：条件没变也从第一页拿最新数据
   const open = (id: string) => navigate(`/installs/${id}`)
 
   const columns: TableColumnsType<Install> = [
@@ -61,8 +62,10 @@ export default function Installs() {
     },
   ]
 
-  const onFinish = ({ created, ...rest }: FilterForm) =>
+  const onFinish = ({ created, ...rest }: FilterForm) => {
     setFilters({ ...rest, install_id: rest.install_id?.trim(), ...rangeParams(created) })
+    setRuns((n) => n + 1)
+  }
 
   return (
     <Flex vertical gap={16}>
@@ -91,11 +94,11 @@ export default function Installs() {
           查询
         </Button>
       </Form>
-      <CursorTable<Install>
-        key={JSON.stringify(filters)}
+      <PagedTable<Install>
+        key={runs}
         rowKey="install_id"
         columns={columns}
-        fetchPage={(cursor) => apiGet<Page<Install>>('/installs', { ...filters, cursor })}
+        fetchPage={(page) => apiGet<Page<Install>>('/installs', { ...filters, ...page })}
         onRowClick={(r) => open(r.install_id)}
       />
     </Flex>

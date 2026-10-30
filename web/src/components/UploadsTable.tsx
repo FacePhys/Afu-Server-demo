@@ -7,7 +7,7 @@ import { useApi } from '../api/useApi'
 import { fmtDuration, fmtNum } from '../utils/format'
 import { fmtYuan } from '../utils/money'
 import { fmtMs, fmtTime } from '../utils/time'
-import CursorTable from './CursorTable'
+import PagedTable from './PagedTable'
 import { DurationText, IdText, JsonView } from './Common'
 
 /** 客户端毫秒时间戳：显示北京时间，悬停看原始值 */
@@ -90,10 +90,10 @@ export default function UploadsTable({ filters, showInstall = true }: { filters:
   ]
   return (
     <>
-      <CursorTable<Report>
+      <PagedTable<Report>
         rowKey={(r) => String(r.id)}
         columns={columns}
-        fetchPage={(cursor) => apiGet<Page<Report>>('/reports', { ...filters, cursor })}
+        fetchPage={(page) => apiGet<Page<Report>>('/reports', { ...filters, ...page })}
       />
       {openId !== undefined && <ReportDrawer id={openId} onClose={() => setOpenId(undefined)} />}
     </>

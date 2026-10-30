@@ -1,8 +1,13 @@
 // 与 internal/console/types.go 一一对应，接口说明见 docs/internal-console.md。
 
+/** 列表的一页，按id倒序(新的在前) */
 export interface Page<T> {
   items: T[]
-  next_cursor: string // 没有下一页时为空字符串
+  page: number
+  page_size: number
+  total: number // 最多数到10000
+  total_capped: boolean // 实际比 total 多，只能翻看最近 total 条
+  max_id: number // 本次用的快照，翻页时原样带上
 }
 
 export interface Me {

@@ -49,14 +49,14 @@ GRANT SELECT, INSERT ON afu.billing_ledger TO 'afu_console'@'10.%';
 3. 成功返回http 200 + 数据对象本身；失败返回对应状态码 + `{"code": "...", "msg": "..."}`，和主接口的错误格式一致。
 4. 时间参数 `from`、`to` 用RFC3339，例如 `2026-10-26T00:00:00+08:00`，区间左闭右开。按天统计的区间最长92天。
 5. 时间字段返回RFC3339(UTC)，例如 `2026-10-26T04:14:52.963Z`；客户端上报的 `ts`、`start_ts`、`end_ts` 原样返回毫秒时间戳。
-6. 列表统一用游标分页，按id倒序(新的在前)：
-   1. 参数 `limit` 默认20、最大100；`cursor` 为上一页返回的 `next_cursor`。
-   2. 返回 `{"items": [...], "next_cursor": "123"}`，没有下一页时 `next_cursor` 为空字符串。
-   3. 不返回总数：上报、测量表会很大，`COUNT(*)` 和 `OFFSET` 都慢，总量看「概览」。
+6. 列表统一按页码分页，按id倒序(新的在前)：
+   1. 参数 `page` 从1开始，`page_size` 默认20、最大100；`max_id` 是快照：第一页不传，由服务端取当时表里最大的id，翻页时原样带上上一次返回的 `max_id`，只看 `id ≤ max_id` 的记录，翻页期间新进来的数据不会让页码错位、总数变化。要看最新数据就不带 `max_id` 重新从第一页查。
+   2. 返回 `{"items": [...], "page": 1, "page_size": 20, "total": 991, "total_capped": false, "max_id": 70331}`。
+   3. 上报、流水表会很大，`COUNT(*)` 和 `OFFSET` 都要有上限：总数最多数到10000(只数到第10001条就停)，超过时 `total` 为10000、`total_capped` 为 true；也只能翻到前10000条以内(`page × page_size` 超过10000返回400)，更早的数据缩小时间范围再查。准确的总量看「概览」。
 
 | http状态码 | code           | 触发条件                                     |
 | ---------- | -------------- | -------------------------------------------- |
-| 400        | bad_request    | 参数格式错误、时间区间超过92天、limit超过100 |
+| 400        | bad_request    | 参数格式错误、时间区间超过92天、page_size超过100、page超出前10000条 |
 | 401        | unauthorized   | 没带Token或Token不对                         |
 | 404        | not_found      | 安装记录、上报记录不存在                     |
 | 409        | app_key_exists | 导入的 App Key 已经存在                      |
@@ -78,7 +78,7 @@ GRANT SELECT, INSERT ON afu.billing_ledger TO 'afu_console'@'10.%';
 | `POST /app-keys`               | 生成 App Key；传 `app_key` 时按原值导入                  |
 | `PATCH /app-keys/{id}`         | 停用 / 启用、改备注、改单价、透支额度和离线可用次数      |
 | `POST /app-keys/{id}/recharge` | 充值                                                     |
-| `GET /app-keys/{id}/ledger`    | 计费流水(扣费、充值)，游标分页                           |
+| `GET /app-keys/{id}/ledger`    | 计费流水(扣费、充值)，分页                               |
 
 ### GET /me
 
@@ -140,7 +140,7 @@ GRANT SELECT, INSERT ON afu.billing_ledger TO 'afu_console'@'10.%';
 
 ### GET /installs
 
-参数：`install_id`(精确匹配)、`platform`、`reset_reason`、`from`、`to`(按创建时间)、`cursor`、`limit`。`reset_reason` 传 `first` 表示首次安装(库里为空字符串)。
+参数：`install_id`(精确匹配)、`platform`、`reset_reason`、`from`、`to`(按创建时间)、`page`、`page_size`、`max_id`。`reset_reason` 传 `first` 表示首次安装(库里为空字符串)。
 
 ```json
 {
@@ -157,7 +157,7 @@ GRANT SELECT, INSERT ON afu.billing_ledger TO 'afu_console'@'10.%';
       "updated_at": "2026-10-26T04:14:52.972Z"
     }
   ],
-  "next_cursor": ""
+  "page": 1, "page_size": 20, "total": 1, "total_capped": false, "max_id": 2
 }
 ```
 
@@ -167,7 +167,7 @@ GRANT SELECT, INSERT ON afu.billing_ledger TO 'afu_console'@'10.%';
 
 ### GET /reports
 
-参数：`install_id`、`from`、`to`(按received_at)、`max_dt_ms`(只看带有时长不超过该值的计次记录的上报，传5000即含异常计次)、`cursor`、`limit`。`max_dt_ms` 按 install_id + seq 关联measurements表。列表直接带上报内容：从明文解析出的 `counters`(累计值)和 `measurements`(本次上报带的计次记录，空上报为 `[]`)，以及从计费流水取的本次扣费 `charge`(0.0001元，没扣费为0)；不带原始明文，原文看详情接口。
+参数：`install_id`、`from`、`to`(按received_at)、`max_dt_ms`(只看带有时长不超过该值的计次记录的上报，传5000即含异常计次)、`page`、`page_size`、`max_id`。`max_dt_ms` 按 install_id + seq 关联measurements表。列表直接带上报内容：从明文解析出的 `counters`(累计值)和 `measurements`(本次上报带的计次记录，空上报为 `[]`)，以及从计费流水取的本次扣费 `charge`(0.0001元，没扣费为0)；不带原始明文，原文看详情接口。
 
 ```json
 {
@@ -178,7 +178,7 @@ GRANT SELECT, INSERT ON afu.billing_ledger TO 'afu_console'@'10.%';
      "measurements": [{"no": 1, "start_ts": 1792478738236, "end_ts": 1792478743241, "frames": 151, "dt_ms": 5005}],
      "charge": 5000}
   ],
-  "next_cursor": ""
+  "page": 1, "page_size": 20, "total": 1, "total_capped": false, "max_id": 2
 }
 ```
 
@@ -240,7 +240,7 @@ GRANT SELECT, INSERT ON afu.billing_ledger TO 'afu_console'@'10.%';
 
 `amount` 必须大于0(上例50元)；锁住这个 App Key 的行加余额，记一条充值流水(操作人为后台Token的name)，返回更新后的 App Key。
 
-`GET /app-keys/{id}/ledger` 返回计费流水，按id倒序，参数同列表的 `cursor`、`limit`：
+`GET /app-keys/{id}/ledger` 返回计费流水，按id倒序，参数同列表的 `page`、`page_size`、`max_id`：
 
 ```json
 {
@@ -250,7 +250,7 @@ GRANT SELECT, INSERT ON afu.billing_ledger TO 'afu_console'@'10.%';
     {"id": 5, "kind": "consume", "amount": -5000, "balance_after": -10000, "count": 1, "unit_price": 5000,
      "install_id": "d625747c96a74f6c4ba7e2a6b8c3e597", "seq": 4, "operator": "", "remark": "", "created_at": "2026-10-27T11:29:41.000Z"}
   ],
-  "next_cursor": ""
+  "page": 1, "page_size": 20, "total": 2, "total_capped": false, "max_id": 6
 }
 ```
 
@@ -278,7 +278,7 @@ internal/console/
 ├── auth.go       # Token校验
 ├── handlers.go   # 各查询接口
 ├── appkeys.go    # App Key 管理(生成或导入、定价、充值、流水、停用 / 启用)
-├── params.go     # 参数解析(时间区间、游标、limit)
+├── params.go     # 参数解析(时间区间、分页)
 └── types.go      # 响应结构体
 web/
 ├── embed.go      # package web，//go:embed all:dist
@@ -328,7 +328,7 @@ web/
     │   ├── Uploads.tsx       # 上传记录列表页
     │   └── AppKeys.tsx       # App Key 管理
     ├── components/
-    │   ├── CursorTable.tsx   # 游标分页表格：上一页 / 下一页
+    │   ├── PagedTable.tsx    # 分页表格：总数、页码、跳页、每页条数、刷新
     │   ├── TimeRange.tsx     # 今天 / 近7天 / 近30天 / 自定义
     │   ├── DailyCharts.tsx   # 按天柱状图：计次、测量时长
     │   ├── UploadsTable.tsx  # 上传记录表格(带明文抽屉)，列表页和安装详情共用
@@ -411,7 +411,7 @@ web/
 
 ## 测试
 
-1. 后端单元测试：鉴权(无Token、错误Token、正确Token)、参数解析(时间格式、区间上限、limit上限、游标)。
+1. 后端单元测试：鉴权(无Token、错误Token、正确Token)、参数解析(时间格式、区间上限、分页参数和上限)。
 2. 后端集成测试(`AFU_TEST_DSN`，和主流程的集成测试共用测试库，`make itest` 用 `-p 1` 串行跑)：造几条安装、上报、测量，校验每个接口的统计数字、过滤条件、翻页不重不漏、按北京时间分天；App Key 的生成、导入、重复导入、停用、定价、充值、流水与计费状态；上传记录的本次扣费。
 3. 前端：`tsc --noEmit` 类型检查和构建必须通过；`utils/` 里的时间、时长格式化写单元测试(Vitest)。
 

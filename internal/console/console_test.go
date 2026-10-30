@@ -132,24 +132,46 @@ func testContext(query string) *gin.Context {
 
 func TestParsePage(t *testing.T) {
 	cases := []struct {
-		query  string
-		cursor uint64
-		limit  int
-		ok     bool
+		query string
+		want  pageQuery
+		ok    bool
 	}{
-		{"", 0, 20, true},
-		{"limit=100&cursor=42", 42, 100, true},
-		{"limit=0", 0, 0, false},
-		{"limit=101", 0, 0, false},
-		{"limit=x", 0, 0, false},
-		{"cursor=0", 0, 0, false},
-		{"cursor=-1", 0, 0, false},
+		{"", pageQuery{page: 1, size: 20}, true},
+		{"page=3&page_size=50&max_id=42", pageQuery{page: 3, size: 50, maxID: 42}, true},
+		{"max_id=0", pageQuery{page: 1, size: 20}, true},                  // 0 表示还没定快照
+		{"page=500", pageQuery{page: 500, size: 20}, true},                // 第9981~10000条
+		{"page=100&page_size=100", pageQuery{page: 100, size: 100}, true}, // 第9901~10000条
+		{"page=501", pageQuery{}, false},                                  // 超过前10000条
+		{"page=101&page_size=100", pageQuery{}, false},
+		{"page=9223372036854775807", pageQuery{}, false}, // 不能因为溢出放过
+		{"page=0", pageQuery{}, false},
+		{"page=-1", pageQuery{}, false},
+		{"page=x", pageQuery{}, false},
+		{"page_size=0", pageQuery{}, false},
+		{"page_size=101", pageQuery{}, false},
+		{"page_size=x", pageQuery{}, false},
+		{"max_id=-1", pageQuery{}, false},
+		{"max_id=x", pageQuery{}, false},
 	}
 	for _, c := range cases {
-		cursor, limit, err := parsePage(testContext(c.query))
-		if (err == nil) != c.ok || (c.ok && (cursor != c.cursor || limit != c.limit)) {
-			t.Fatalf("%q: cursor=%d limit=%d err=%v", c.query, cursor, limit, err)
+		got, err := parsePage(testContext(c.query))
+		if (err == nil) != c.ok || (c.ok && got != c.want) {
+			t.Fatalf("%q: got %+v err=%v", c.query, got, err)
 		}
+	}
+}
+
+func TestNewPage(t *testing.T) {
+	p := pageQuery{page: 2, size: 20, maxID: 99}
+	if got := newPage([]int{1, 2}, p, 21, func(v int) int { return v * 10 }); got.Total != 21 || got.TotalCapped ||
+		got.Page != 2 || got.PageSize != 20 || got.MaxID != 99 || len(got.Items) != 2 || got.Items[1] != 20 {
+		t.Fatalf("got %+v", got)
+	}
+	if got := newPage([]int{}, p, maxCountRows+1, func(v int) int { return v }); got.Total != maxCountRows || !got.TotalCapped {
+		t.Fatalf("超过上限: %+v", got)
+	}
+	if got := newPage[int, int](nil, p, 0, func(v int) int { return v }); got.Items == nil {
+		t.Fatal("没有数据时 items 应为 []，不是 null")
 	}
 }
 

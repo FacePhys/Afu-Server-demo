@@ -2,6 +2,7 @@ package console
 
 import (
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -152,17 +153,7 @@ func TestIntegrationDaily(t *testing.T) {
 }
 
 func TestIntegrationInstalls(t *testing.T) {
-	h, _ := setupServer(t)
-
-	// 翻页不重不漏：按id倒序 C、B、A
-	p1 := getJSON[Page[Install]](t, h, api+"/installs?limit=2")
-	if len(p1.Items) != 2 || p1.Items[0].InstallID != idC || p1.Items[1].InstallID != idB || p1.NextCursor == "" {
-		t.Fatalf("第1页 = %+v", p1)
-	}
-	p2 := getJSON[Page[Install]](t, h, api+"/installs?limit=2&cursor="+p1.NextCursor)
-	if len(p2.Items) != 1 || p2.Items[0].InstallID != idA || p2.NextCursor != "" {
-		t.Fatalf("第2页 = %+v", p2)
-	}
+	h, db := setupServer(t)
 
 	filters := map[string][]string{
 		"platform=ios":                     {idB},
@@ -177,8 +168,8 @@ func TestIntegrationInstalls(t *testing.T) {
 		for _, it := range p.Items {
 			got = append(got, it.InstallID)
 		}
-		if strings.Join(got, ",") != strings.Join(want, ",") {
-			t.Fatalf("%s: got %v, want %v", q, got, want)
+		if strings.Join(got, ",") != strings.Join(want, ",") || p.Total != int64(len(want)) {
+			t.Fatalf("%s: got %v (total %d), want %v", q, got, p.Total, want)
 		}
 	}
 
@@ -189,13 +180,63 @@ func TestIntegrationInstalls(t *testing.T) {
 	if w := get(t, h, api+"/installs/dddddddddddddddddddddddddddddddd", testToken); w.Code != http.StatusNotFound {
 		t.Fatalf("不存在的编号: %d", w.Code)
 	}
+
+	// 翻页不重不漏：按id倒序 C、B、A；第1页定下快照，之后新增的数据不影响翻页和总数
+	p1 := getJSON[Page[Install]](t, h, api+"/installs?page_size=2")
+	if len(p1.Items) != 2 || p1.Items[0].InstallID != idC || p1.Items[1].InstallID != idB ||
+		p1.Page != 1 || p1.PageSize != 2 || p1.Total != 3 || p1.TotalCapped || p1.MaxID == 0 {
+		t.Fatalf("第1页 = %+v", p1)
+	}
+	const idE = "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+	if err := db.Create(&store.Install{InstallID: idE, AppKey: "AK1", AppID: "com.a", Platform: "ios", SDK: "1.0"}).Error; err != nil {
+		t.Fatal(err)
+	}
+	p2 := getJSON[Page[Install]](t, h, api+"/installs?page_size=2&page=2&max_id="+itoa(p1.MaxID))
+	if len(p2.Items) != 1 || p2.Items[0].InstallID != idA || p2.Page != 2 || p2.Total != 3 || p2.MaxID != p1.MaxID {
+		t.Fatalf("第2页 = %+v", p2)
+	}
+	if p3 := getJSON[Page[Install]](t, h, api+"/installs?page_size=2&page=3&max_id="+itoa(p1.MaxID)); len(p3.Items) != 0 || p3.Total != 3 {
+		t.Fatalf("超出最后一页 = %+v", p3)
+	}
+	// 刷新(不带快照)：看到新数据
+	if fresh := getJSON[Page[Install]](t, h, api+"/installs?page_size=2"); fresh.Total != 4 || fresh.Items[0].InstallID != idE || fresh.MaxID <= p1.MaxID {
+		t.Fatalf("刷新 = %+v", fresh)
+	}
+}
+
+// 总数最多数到 maxCountRows，也只能翻到这么多条以内
+func TestIntegrationPageCap(t *testing.T) {
+	h, db := setupServer(t)
+	rows := make([]store.Install, maxCountRows)
+	for i := range rows {
+		rows[i] = store.Install{InstallID: fmt.Sprintf("%032x", i+1), AppKey: "AK9", AppID: "com.z", Platform: "android", SDK: "1.0"}
+	}
+	if err := db.CreateInBatches(&rows, 2000).Error; err != nil {
+		t.Fatal(err)
+	}
+	p := getJSON[Page[Install]](t, h, api+"/installs?page_size=100&page=100") // 第9901~10000条
+	if p.Total != maxCountRows || !p.TotalCapped || len(p.Items) != 100 {
+		t.Fatalf("total=%d capped=%v items=%d", p.Total, p.TotalCapped, len(p.Items))
+	}
+	if w := get(t, h, api+"/installs?page_size=100&page=101", testToken); w.Code != http.StatusBadRequest {
+		t.Fatalf("超过前10000条: %d", w.Code)
+	}
+	if p := getJSON[Page[Install]](t, h, api+"/installs?platform=ios"); p.Total != 1 || p.TotalCapped { // 筛选后不到上限
+		t.Fatalf("筛选后 = %+v", p)
+	}
 }
 
 func TestIntegrationReports(t *testing.T) {
 	h, _ := setupServer(t)
 	p := getJSON[Page[Report]](t, h, api+"/reports?install_id="+idA)
-	if len(p.Items) != 2 || p.Items[0].Seq != 2 || p.Items[0].Payload != nil {
+	if len(p.Items) != 2 || p.Total != 2 || p.Items[0].Seq != 2 || p.Items[0].Payload != nil {
 		t.Fatalf("列表 = %+v", p)
+	}
+	// 翻页带快照：总数不包含快照之后的上报
+	p1 := getJSON[Page[Report]](t, h, api+"/reports?page_size=1")
+	p2 := getJSON[Page[Report]](t, h, api+"/reports?page_size=1&page=2&max_id="+itoa(p1.MaxID))
+	if p1.Total != 3 || len(p1.Items) != 1 || p2.Total != 3 || len(p2.Items) != 1 || p2.Items[0].ID >= p1.Items[0].ID {
+		t.Fatalf("翻页 = %+v / %+v", p1, p2)
 	}
 	// 列表直接带解析后的上报内容；seq=2 的明文里没有measurements，返回空数组
 	first := p.Items[1]
@@ -244,7 +285,10 @@ func TestIntegrationReportFilters(t *testing.T) {
 func TestIntegrationBadParams(t *testing.T) {
 	h, _ := setupServer(t)
 	for _, path := range []string{
-		"/installs?limit=101",
+		"/installs?page_size=101",
+		"/installs?page=0",
+		"/reports?page=501",
+		"/installs?max_id=x",
 		"/installs?platform=web",
 		"/installs?reset_reason=x",
 		"/installs?install_id=short",
@@ -343,7 +387,7 @@ func TestIntegrationAppKeys(t *testing.T) {
 
 	// 流水：初始余额 + 续费，新的在前，操作人是后台用户
 	ledger := getJSON[Page[LedgerEntry]](t, h, base+"/"+itoa(priced.ID)+"/ledger")
-	if len(ledger.Items) != 2 || ledger.Items[0].Remark != "续费" || ledger.Items[0].Amount != 20000 ||
+	if len(ledger.Items) != 2 || ledger.Total != 2 || ledger.Items[0].Remark != "续费" || ledger.Items[0].Amount != 20000 ||
 		ledger.Items[0].Operator != "alice" || ledger.Items[1].Remark != "初始余额" || ledger.Items[1].BalanceAfter != 10000 {
 		t.Fatalf("流水 = %+v", ledger.Items)
 	}
