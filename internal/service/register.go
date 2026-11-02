@@ -6,14 +6,16 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/FacePhys/Afu-Server-demo/internal/anomaly"
 	"github.com/FacePhys/Afu-Server-demo/internal/protocol"
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
 )
 
 // Register 处理注册：不先查再插，直接插入，用唯一键判断install_id是否已存在，天然处理并发。
-// 已存在时换号(不记录旧编号)，返回refused(conflict)。
+// 已存在时换号，返回refused(conflict)；旧编号和新编号记进异常清单。
 func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (string, any, error) {
-	key, err := s.loadAppKey(ctx, req.InstallID, req.AppKey)
+	ev := requestEvent(req.InstallID, req.AppKey, req.Platform, req.SDK, 0)
+	key, err := s.loadAppKey(ctx, protocol.TypeRegister, ev)
 	if err != nil {
 		return "", nil, err
 	}
@@ -30,7 +32,7 @@ func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (strin
 		Platform: req.Platform, SDK: req.SDK, ResetReason: req.Reset}
 	err = db.Create(&inst).Error
 	if err == nil {
-		return protocol.TypeAck, s.ack(inst.InstallID, 0, 0, capRuns(key, hasQuota, 0)), nil // 新编号没有违规
+		return protocol.TypeAck, s.ack(inst.InstallID, 0, 0, key, hasQuota), nil
 	}
 	if !errors.Is(err, gorm.ErrDuplicatedKey) {
 		return "", nil, err
@@ -42,5 +44,7 @@ func (s *Service) Register(ctx context.Context, req protocol.RegisterReq) (strin
 		return "", nil, err
 	}
 	s.log.Info("install_id reassigned", "reason", protocol.ReasonConflict, "old", req.InstallID, "new", newInst.InstallID)
-	return protocol.TypeRefused, s.refused(newInst.InstallID, 0, 0, capRuns(key, hasQuota, 0), protocol.ReasonConflict), nil
+	ev.Kind, ev.RelatedID, ev.Detail = anomaly.KindReassignConflict, newInst.InstallID, "注册时编号已存在，已换成新编号"
+	s.anomalies.Record(ctx, ev)
+	return protocol.TypeRefused, s.refused(newInst.InstallID, 0, 0, key, hasQuota, protocol.ReasonConflict), nil
 }

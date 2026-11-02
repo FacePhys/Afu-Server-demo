@@ -30,3 +30,26 @@ export const RESET_REASON_OPTIONS = [
   { value: 'conflict', label: '编号冲突' },
   { value: 'unregistered', label: '未注册' },
 ]
+
+/** 异常清单的类型，与 internal/anomaly 的 Kind* 一致 */
+export const ANOMALY_KIND_LABEL: Record<string, string> = {
+  time_reversed: '计次起止时间颠倒',
+  bad_payload: '明文不合法(400)',
+  invalid_app_key: 'App Key 无效(403)',
+  reassign_conflict: '换号：注册编号冲突',
+  reassign_unregistered: '换号：上报编号不存在',
+  counters_regressed: '计数变小',
+  sessions_over_cap: '新增计次超过离线次数',
+}
+
+export const ANOMALY_KIND_COLOR: Record<string, string> = {
+  time_reversed: 'red',
+  bad_payload: 'volcano',
+  invalid_app_key: 'orange',
+  reassign_conflict: 'blue',
+  reassign_unregistered: 'geekblue',
+  counters_regressed: 'purple',
+  sessions_over_cap: 'gold',
+}
+
+export const ANOMALY_KIND_OPTIONS = Object.entries(ANOMALY_KIND_LABEL).map(([value, label]) => ({ value, label }))

@@ -12,40 +12,52 @@ import (
 
 	"gorm.io/gorm"
 
+	"github.com/FacePhys/Afu-Server-demo/internal/anomaly"
 	"github.com/FacePhys/Afu-Server-demo/internal/billing"
 	"github.com/FacePhys/Afu-Server-demo/internal/config"
 	"github.com/FacePhys/Afu-Server-demo/internal/protocol"
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
-	"github.com/FacePhys/Afu-Server-demo/internal/violation"
 )
 
 // 生成的install_id撞上唯一键时最多重试的次数，正常情况下一次就成功。
 const maxNewIDAttempts = 3
 
 type Service struct {
-	db         *gorm.DB
-	billing    billing.Billing
-	notifier   billing.Notifier
-	violations *violation.Store
-	cfg        config.MeterConfig
-	log        *slog.Logger
-	newID      func() string // 测试可替换
+	db        *gorm.DB
+	billing   billing.Billing
+	notifier  billing.Notifier
+	anomalies *anomaly.Recorder
+	cfg       config.MeterConfig
+	log       *slog.Logger
+	newID     func() string // 测试可替换
 }
 
-func New(db *gorm.DB, b billing.Billing, n billing.Notifier, v *violation.Store, cfg config.MeterConfig, log *slog.Logger) *Service {
-	return &Service{db: db, billing: b, notifier: n, violations: v, cfg: cfg, log: log, newID: newInstallID}
+func New(db *gorm.DB, b billing.Billing, n billing.Notifier, a *anomaly.Recorder, cfg config.MeterConfig, log *slog.Logger) *Service {
+	return &Service{db: db, billing: b, notifier: n, anomalies: a, cfg: cfg, log: log, newID: newInstallID}
 }
 
-// loadAppKey 客户端传来的 app_key 必须在 app_keys 表里且已启用，否则返回 403 invalid_app_key，不入库。
-// 返回的记录带离线可用次数、违规上限，组装 cap_runs 用。
-func (s *Service) loadAppKey(ctx context.Context, installID, appKey string) (store.AppKey, error) {
+// loadAppKey 客户端传来的 app_key 必须在 app_keys 表里且已启用，否则返回 403 invalid_app_key，不入库，记进异常清单。
+// e 是这次请求的设备、app_key 等(见 requestEvent)。返回的记录带离线可用次数，组装 cap_runs 用。
+func (s *Service) loadAppKey(ctx context.Context, typ string, e anomaly.Event) (store.AppKey, error) {
 	var k store.AppKey
-	err := s.db.WithContext(ctx).Select("status", "offline_runs", "max_violations").Where("app_key = ?", appKey).Take(&k).Error
-	if errors.Is(err, gorm.ErrRecordNotFound) || (err == nil && k.Status != store.AppKeyEnabled) {
-		s.log.Warn("invalid app_key", "install_id", installID, "app_key", appKey, "status", k.Status)
+	err := s.db.WithContext(ctx).Select("status", "offline_runs").Where("app_key = ?", e.AppKey).Take(&k).Error
+	notFound := errors.Is(err, gorm.ErrRecordNotFound)
+	if notFound || (err == nil && k.Status != store.AppKeyEnabled) {
+		s.log.Warn("invalid app_key", "install_id", e.InstallID, "app_key", e.AppKey, "status", k.Status)
+		why := "已停用"
+		if notFound {
+			why = "不存在"
+		}
+		e.Kind, e.Detail = anomaly.KindInvalidAppKey, fmt.Sprintf("%s：app_key %s", anomaly.RequestLabel(typ), why)
+		s.anomalies.Record(ctx, e)
 		return k, protocol.ErrInvalidAppKey
 	}
 	return k, err
+}
+
+// requestEvent 这次请求的设备、app_key、平台、sdk、seq，记异常用；类型和详情由调用方填。
+func requestEvent(installID, appKey, platform, sdk string, seq uint64) anomaly.Event {
+	return anomaly.Event{InstallID: installID, AppKey: appKey, Platform: platform, SDK: sdk, Seq: seq}
 }
 
 // newInstallID 生成32位小写hex，和客户端生成的格式一致。
@@ -70,21 +82,16 @@ func (s *Service) createWithNewID(db *gorm.DB, inst *store.Install) error {
 	return fmt.Errorf("生成install_id连续%d次冲突", maxNewIDAttempts)
 }
 
-// capRuns 按「回复字段计算」：取 App Key 的离线可用次数；余额加透支额度不够付下一次，
-// 或者设备的违规次数达到 App Key 的违规上限时为0(停发)。
-func capRuns(key store.AppKey, hasQuota bool, violations uint64) uint64 {
-	if !hasQuota || key.ViolationLimitReached(violations) {
-		return 0
+// ack 按「回复字段计算」组装ack：acked 是已确认的累计计次；cap_runs 取 App Key 的离线可用次数，
+// 余额加透支额度不够付下一次时为0；cap_frames 固定为0，表示不按帧数限制。
+func (s *Service) ack(installID string, seq, acked uint64, key store.AppKey, hasQuota bool) protocol.Ack {
+	a := protocol.Ack{InstallID: installID, Seq: seq, AckedSessions: acked, TTLSec: s.cfg.TTLSec, ReportSec: s.cfg.ReportSec}
+	if hasQuota {
+		a.CapRuns = key.OfflineRuns
 	}
-	return key.OfflineRuns
+	return a
 }
 
-// ack 组装ack：acked 是已确认的累计计次；cap_frames 固定为0，表示不按帧数限制。
-func (s *Service) ack(installID string, seq, acked, capRuns uint64) protocol.Ack {
-	return protocol.Ack{InstallID: installID, Seq: seq, AckedSessions: acked, CapRuns: capRuns,
-		TTLSec: s.cfg.TTLSec, ReportSec: s.cfg.ReportSec}
-}
-
-func (s *Service) refused(installID string, seq, acked, capRuns uint64, reason string) protocol.Refused {
-	return protocol.Refused{Ack: s.ack(installID, seq, acked, capRuns), Reason: reason}
+func (s *Service) refused(installID string, seq, acked uint64, key store.AppKey, hasQuota bool, reason string) protocol.Refused {
+	return protocol.Refused{Ack: s.ack(installID, seq, acked, key, hasQuota), Reason: reason}
 }

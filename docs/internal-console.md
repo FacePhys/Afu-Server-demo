@@ -38,9 +38,9 @@ CREATE USER 'afu_console'@'10.%' IDENTIFIED BY '<密码>';
 GRANT SELECT ON afu.installs TO 'afu_console'@'10.%';
 GRANT SELECT ON afu.reports TO 'afu_console'@'10.%';
 GRANT SELECT ON afu.measurements TO 'afu_console'@'10.%';
+GRANT SELECT ON afu.anomalies TO 'afu_console'@'10.%';
 GRANT SELECT, INSERT, UPDATE ON afu.app_keys TO 'afu_console'@'10.%';
 GRANT SELECT, INSERT ON afu.billing_ledger TO 'afu_console'@'10.%';
-GRANT SELECT, UPDATE ON afu.install_violations TO 'afu_console'@'10.%';  -- 违规清零
 ```
 
 ## 接口约定
@@ -73,12 +73,13 @@ GRANT SELECT, UPDATE ON afu.install_violations TO 'afu_console'@'10.%';  -- 违�
 | `GET /stats/daily`             | 按天统计                                                 |
 | `GET /installs`                | 安装记录列表                                             |
 | `GET /installs/{install_id}`   | 安装记录详情                                             |
-| `POST /installs/{install_id}/violations/reset` | 违规清零，从下一次回复开始恢复下发 cap_runs |
 | `GET /reports`                 | 上传记录列表：每行一次上报，带解析后的本次计次和累计计数 |
 | `GET /reports/{id}`            | 单次上传详情，含解密后的原始明文                         |
+| `GET /anomalies`               | 异常清单：每行一台设备的一类异常，次数累加               |
+| `GET /anomalies/kinds`         | 异常清单按类型统计：设备数、次数                         |
 | `GET /app-keys`                | App Key 列表(新的在前)                                   |
 | `POST /app-keys`               | 生成 App Key；传 `app_key` 时按原值导入                  |
-| `PATCH /app-keys/{id}`         | 停用 / 启用、改备注、改单价、透支额度、离线可用次数和违规上限 |
+| `PATCH /app-keys/{id}`         | 停用 / 启用、改备注、改单价、透支额度和离线可用次数      |
 | `POST /app-keys/{id}/recharge` | 充值                                                     |
 | `GET /app-keys/{id}/ledger`    | 计费流水(扣费、充值)，分页                               |
 
@@ -142,9 +143,7 @@ GRANT SELECT, UPDATE ON afu.install_violations TO 'afu_console'@'10.%';  -- 违�
 
 ### GET /installs
 
-参数：`install_id`(精确匹配)、`platform`、`reset_reason`、`violation`、`from`、`to`(按创建时间)、`page`、`page_size`、`max_id`。`reset_reason` 传 `first` 表示首次安装(库里为空字符串)；`violation` 传 `any` 只看当前有违规(没清零)的，传 `stopped` 只看违规次数达到 App Key 上限、停发中的。
-
-每条带 `violations`：设备的违规情况(计次记录 start_ts > end_ts 算一次违规，见 docs/development.md「违规计数」)。`count` 当前次数(清零后重新累计)，`total` 历史累计，`limit` 安装记录的 App Key 的违规上限(0为不限)，`stopped` 是否已达上限停发；没有违规时次数都是0、时间为 null。
+参数：`install_id`(精确匹配)、`platform`、`reset_reason`、`from`、`to`(按创建时间)、`page`、`page_size`、`max_id`。`reset_reason` 传 `first` 表示首次安装(库里为空字符串)。
 
 ```json
 {
@@ -157,8 +156,6 @@ GRANT SELECT, UPDATE ON afu.install_violations TO 'afu_console'@'10.%';  -- 违�
       "reset_reason": "",
       "confirmed_seq": 1,
       "counters": {"sessions": 1, "frames_ok": 300, "dt_ms": 9966, "mono_ms": 9968, "run_ok": 10, "gated_frames": 0, "gated_runs": 0},
-      "violations": {"count": 3, "total": 4, "limit": 3, "stopped": true, "last_seq": 7, "last_no": 7,
-                     "last_at": "2026-10-30T10:46:12.031Z", "reset_by": "liujiaxuan", "reset_at": "2026-10-29T08:00:00.000Z"},
       "created_at": "2026-10-26T04:14:52.963Z",
       "updated_at": "2026-10-26T04:14:52.972Z"
     }
@@ -170,10 +167,6 @@ GRANT SELECT, UPDATE ON afu.install_violations TO 'afu_console'@'10.%';  -- 违�
 ### GET /installs/{install_id}
 
 返回单条，字段同上；不存在返回404。
-
-### POST /installs/{install_id}/violations/reset
-
-违规清零：当前违规次数归0(历史累计不变)，从下一次回复开始恢复下发 cap_runs；记操作人(后台Token的name)和时间，写一条 `violations reset` 操作日志。先写 MySQL，提交后同步 Redis 缓存(清零让 epoch 加1，清零前的旧值写不进缓存)。请求体不用带；没有违规记录时什么也不做；安装记录不存在返回404。返回清零后的安装记录，字段同上。
 
 ### GET /reports
 
@@ -207,37 +200,66 @@ GRANT SELECT, UPDATE ON afu.install_violations TO 'afu_console'@'10.%';  -- 违�
 }
 ```
 
+### GET /anomalies
+
+异常清单(见 docs/development.md「异常清单」)：同一台设备的同一类异常一行，`count` 是累计次数，`seq`、`detail` 是最近一次的。按最近发生时间倒序，分页同其他列表；已有的行又发生时 `last_at` 会变，翻页时可能换位置。
+
+参数：`kind`(一类，取值见下)、`install_id`(同时匹配换号后的新编号 `related_id`)、`app_key`、`platform`、`from`、`to`(发生时间：首次 ~ 最近和区间有交集)、`page`、`page_size`、`max_id`。
+
+`kind`：`time_reversed` 计次起止时间颠倒、`bad_payload` 明文不合法、`invalid_app_key` App Key 无效、`reassign_conflict` 注册编号冲突换号、`reassign_unregistered` 上报编号不存在换号、`counters_regressed` 计数变小、`sessions_over_cap` 新增计次超过离线可用次数。
+
+```json
+{
+  "items": [
+    {"id": 3, "kind": "time_reversed", "install_id": "d330893f125c723c0b5758f43db6091f", "related_id": "",
+     "app_key": "AK-fde5356ef66cf97eff79aba8cd823fa3", "platform": "ios", "sdk": "1.2.0-beta.2+c9faa98.dirty", "seq": 3,
+     "detail": "本次 1 条；计次 #2 start_ts=1793357109956 end_ts=1793356994407，结束比开始早 115.5 秒", "count": 1,
+     "first_at": "2026-10-30T10:46:12.031Z", "last_at": "2026-10-30T10:46:12.031Z"}
+  ],
+  "page": 1, "page_size": 20, "total": 1, "total_capped": false, "max_id": 3
+}
+```
+
+`install_id` 为空表示请求里的编号格式不对或解析不出(这类合成一行)。
+
+### GET /anomalies/kinds
+
+按类型统计，筛选参数同 `GET /anomalies`(不含 `kind`)；没有的类型不返回。`installs` 是行数(设备数)，`count` 是次数合计：
+
+```json
+{"kinds": [{"kind": "bad_payload", "installs": 2, "count": 12}, {"kind": "time_reversed", "installs": 1, "count": 3}]}
+```
+
 ### App Key 管理
 
 `POST /app-keys` 请求体：
 
 ```json
 {"remark": "阿福正式环境", "app_key": "", "unit_price": 5000, "initial_balance": 1000000, "overdraft_limit": 100000,
- "offline_runs": 5, "max_violations": 3}
+ "offline_runs": 5}
 ```
 
 1. `app_key` 留空：生成 `AK-` 加32位小写hex。
 2. `app_key` 有值：按原值导入，用于已经发给客户的 App Key；只能包含字母、数字、`-`、`_`，最多64个字符；已存在返回409。
 3. 金额一律用整数，单位 0.0001 元(上例：单价0.50元/次、初始余额100元、透支额度10元)。`unit_price` 0或不传表示不收费；`initial_balance` 大于0时记一条「初始余额」充值流水。
 4. `offline_runs` 离线可用次数，ack / refused 的 cap_runs 直接下发这个值，含义是「从 acked_sessions 往后还能新增几次计次」；不传默认5，范围0 ~ 16(一份上报最多16条 measurements，离线攒下的计次要能一份装下)；0 相当于停发。
-5. `max_violations` 违规上限：一台设备的违规次数(计次记录 start_ts > end_ts)达到后，给它的回复 cap_runs 为0；不传默认3，0为不限，最大1000。
-6. 返回201和新记录；`created_by` 记录后台Token的name。
+5. 返回201和新记录；`created_by` 记录后台Token的name。
 
 `PATCH /app-keys/{id}` 请求体，下面字段至少一个：
 
 ```json
-{"status": "disabled", "remark": "已停用", "unit_price": 6000, "overdraft_limit": 200000, "offline_runs": 8, "max_violations": 5}
+{"status": "disabled", "remark": "已停用", "unit_price": 6000, "overdraft_limit": 200000, "offline_runs": 8}
 ```
 
 1. 不提供删除，停用即可；停用后带这个 App Key 的注册、上报返回403。
-2. 余额不能在这里改，只能通过充值和上报扣费变化，保证和流水对得上；新单价从下一次上报开始生效，新的离线可用次数、违规上限从下一次回复开始生效(已经放出去的次数不会收回)。
+2. 余额不能在这里改，只能通过充值和上报扣费变化，保证和流水对得上；新单价从下一次上报开始生效，新的离线可用次数从下一次回复开始下发(已经放出去的次数不会收回)。
 3. 生成、修改、充值都会写一条操作日志(操作人、App Key、金额)，另外照常有审计日志。
 
 返回结构：
 
 ```json
 {"id": 1, "app_key": "AK-f24277919892cdc6a5670c27d6fe1212", "remark": "阿福正式环境", "status": "enabled",
- "unit_price": 5000, "balance": 383000, "overdraft_limit": 100000, "used_count": 1234, "offline_runs": 5, "max_violations": 3, "billing_state": "normal",
+ "unit_price": 5000, "balance": 383000, "overdraft_limit": 100000, "used_count": 1234, "offline_runs": 5, "billing_state": "normal",
  "created_by": "liujiaxuan", "created_at": "2026-10-26T11:17:17.222Z", "updated_at": "2026-10-26T11:17:17.222Z"}
 ```
 
@@ -334,19 +356,21 @@ web/
     │   ├── Login.tsx
     │   ├── Overview.tsx
     │   ├── Usage.tsx
-    │   ├── Installs.tsx      # 安装列表：违规次数 / 上限、按违规筛选
-    │   ├── InstallDetail.tsx # 安装详情：违规卡片(清零)、上传记录
+    │   ├── Installs.tsx
+    │   ├── InstallDetail.tsx
     │   ├── Uploads.tsx       # 上传记录列表页
+    │   ├── Anomalies.tsx     # 异常清单：按类型统计、筛选
     │   └── AppKeys.tsx       # App Key 管理
     ├── components/
     │   ├── PagedTable.tsx    # 分页表格：总数、页码、跳页、每页条数、刷新
     │   ├── TimeRange.tsx     # 今天 / 近7天 / 近30天 / 自定义
     │   ├── DailyCharts.tsx   # 按天柱状图：计次、测量时长
     │   ├── UploadsTable.tsx  # 上传记录表格(带明文抽屉)，列表页和安装详情共用
+    │   ├── AnomaliesTable.tsx # 异常清单表格，列表页和安装详情共用
     │   └── Common.tsx        # install_id、新安装原因、时长标签、原始明文展示
     └── utils/
         ├── time.ts       # 北京时间格式化、毫秒时间戳转换
-        ├── format.ts     # 时长、千分位
+        ├── format.ts     # 时长、千分位、异常类型的名称和颜色
         └── utils.test.ts
 ```
 
@@ -423,7 +447,7 @@ web/
 ## 测试
 
 1. 后端单元测试：鉴权(无Token、错误Token、正确Token)、参数解析(时间格式、区间上限、分页参数和上限)。
-2. 后端集成测试(`AFU_TEST_DSN`，和主流程的集成测试共用测试库，`make itest` 用 `-p 1` 串行跑)：造几条安装、上报、测量，校验每个接口的统计数字、过滤条件、翻页不重不漏、按北京时间分天；App Key 的生成、导入、重复导入、停用、定价、充值、流水与计费状态；上传记录的本次扣费；安装的违规次数、按违规筛选、违规清零，App Key 的违规上限。
+2. 后端集成测试(`AFU_TEST_DSN`，和主流程的集成测试共用测试库，`make itest` 用 `-p 1` 串行跑)：造几条安装、上报、测量，校验每个接口的统计数字、过滤条件、翻页不重不漏、按北京时间分天；App Key 的生成、导入、重复导入、停用、定价、充值、流水与计费状态；上传记录的本次扣费；异常清单的排序、各筛选条件(含换号后的编号、时间区间交集)、按类型统计。
 3. 前端：`tsc --noEmit` 类型检查和构建必须通过；`utils/` 里的时间、时长格式化写单元测试(Vitest)。
 
 ## 开发顺序

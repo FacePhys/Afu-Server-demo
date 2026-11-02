@@ -176,4 +176,10 @@ func TestDeltaAndMax(t *testing.T) {
 	if _, regressed := Delta(old, old); regressed {
 		t.Fatal("相同计数不应regressed")
 	}
+	if got := RegressedFields(old, cur); len(got) != 1 || got[0] != "frames_ok 100→40" {
+		t.Fatalf("RegressedFields = %v", got)
+	}
+	if got := RegressedFields(old, old); got != nil {
+		t.Fatalf("没变小 = %v", got)
+	}
 }

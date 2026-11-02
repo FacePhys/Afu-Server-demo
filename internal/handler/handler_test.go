@@ -17,6 +17,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/FacePhys/Afu-Server-demo/internal/anomaly"
 	"github.com/FacePhys/Afu-Server-demo/internal/envelope"
 	"github.com/FacePhys/Afu-Server-demo/internal/protocol"
 )
@@ -65,11 +66,18 @@ func (f *fakeService) Report(_ context.Context, _ protocol.ReportReq, raw []byte
 	return f.respType, f.resp, f.err
 }
 
+// fakeRecorder 记下收到的异常。
+type fakeRecorder struct {
+	events []anomaly.Event
+}
+
+func (f *fakeRecorder) Record(_ context.Context, e anomaly.Event) { f.events = append(f.events, e) }
+
 func newRouter(t *testing.T, svc Service) *gin.Engine {
 	t.Helper()
 	gin.SetMode(gin.TestMode)
 	log := slog.New(slog.NewTextHandler(io.Discard, nil))
-	return New(svc, keys{1: key(t)}, 64<<10, log).Router()
+	return New(svc, keys{1: key(t)}, &fakeRecorder{}, 64<<10, log).Router()
 }
 
 func do(t *testing.T, r http.Handler, body string) *httptest.ResponseRecorder {
@@ -135,7 +143,8 @@ func TestBadPayloadLogsReason(t *testing.T) {
 	k := key(t)
 	var logs bytes.Buffer
 	gin.SetMode(gin.TestMode)
-	r := New(&fakeService{}, keys{1: k}, 64<<10, slog.New(slog.NewJSONHandler(&logs, nil))).Router()
+	rec := &fakeRecorder{}
+	r := New(&fakeService{}, keys{1: k}, rec, 64<<10, slog.New(slog.NewJSONHandler(&logs, nil))).Router()
 
 	plain := []byte(`{"install_id":"` + installID + `","app_key":"a","app_id":"b","platform":"ios","seq":7,"ts":1,"sdk":"1",` +
 		`"measurements":[{"no":3,"start_ts":2000,"end_ts":1000,"frames":151,"dt_ms":5033},{"no":0,"start_ts":1,"end_ts":2,"frames":151,"dt_ms":5033}]}`)
@@ -165,6 +174,27 @@ func TestBadPayloadLogsReason(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "frames") {
 		t.Fatalf("日志里不能有明文: %s", logs.String())
+	}
+	// 记进异常清单：带上解析出来的设备、app_key、平台、sdk、seq 和原因
+	want := anomaly.Event{Kind: anomaly.KindBadPayload, InstallID: installID, AppKey: "a", Platform: "ios", SDK: "1", Seq: 7,
+		Detail: "上报：invalid payload: measurements[1] no=0"}
+	if len(rec.events) != 1 || rec.events[0] != want {
+		t.Fatalf("异常清单 = %+v", rec.events)
+	}
+}
+
+// 解密前就失败的请求(多是扫描器)不记异常清单
+func TestErrorsBeforeDecryptNotRecorded(t *testing.T) {
+	rec := &fakeRecorder{}
+	gin.SetMode(gin.TestMode)
+	r := New(&fakeService{}, keys{1: key(t)}, rec, 64<<10, slog.New(slog.NewTextHandler(io.Discard, nil))).Router()
+	for _, body := range []string{"{", envelopeJSON(t, 1, 9, protocol.TypeRegister, "x"), envelopeJSON(t, 1, 1, protocol.TypeRegister, "AAAA")} {
+		if w := do(t, r, body); w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: %d", body, w.Code)
+		}
+	}
+	if len(rec.events) != 0 {
+		t.Fatalf("不应记录: %+v", rec.events)
 	}
 }
 

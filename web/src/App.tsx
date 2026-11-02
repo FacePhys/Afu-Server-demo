@@ -1,10 +1,18 @@
 import { App as AntApp, Button, ConfigProvider, Flex, Layout, Menu } from 'antd'
-import { BarChartOutlined, CloudUploadOutlined, DashboardOutlined, KeyOutlined, MobileOutlined } from '@ant-design/icons'
+import {
+  BarChartOutlined,
+  CloudUploadOutlined,
+  DashboardOutlined,
+  KeyOutlined,
+  MobileOutlined,
+  WarningOutlined,
+} from '@ant-design/icons'
 import zhCN from 'antd/locale/zh_CN'
 import { BrowserRouter, Navigate, Outlet, Route, Routes, useLocation, useNavigate } from 'react-router'
 import { apiGet, tokenStore } from './api/client'
 import type { Me, Meta } from './api/types'
 import { useApi } from './api/useApi'
+import Anomalies from './pages/Anomalies'
 import AppKeys from './pages/AppKeys'
 import InstallDetail from './pages/InstallDetail'
 import Installs from './pages/Installs'
@@ -18,6 +26,7 @@ const MENU = [
   { key: '/usage', icon: <BarChartOutlined />, label: '用量统计' },
   { key: '/installs', icon: <MobileOutlined />, label: '安装' },
   { key: '/uploads', icon: <CloudUploadOutlined />, label: '上传记录' },
+  { key: '/anomalies', icon: <WarningOutlined />, label: '异常清单' },
   { key: '/app-keys', icon: <KeyOutlined />, label: 'App Key' },
 ]
 
@@ -74,6 +83,7 @@ export default function App() {
               <Route path="installs" element={<Installs />} />
               <Route path="installs/:installId" element={<InstallDetail />} />
               <Route path="uploads" element={<Uploads />} />
+              <Route path="anomalies" element={<Anomalies />} />
               <Route path="app-keys" element={<AppKeys />} />
               <Route path="*" element={<Navigate to="/" replace />} />
             </Route>

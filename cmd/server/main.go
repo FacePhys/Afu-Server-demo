@@ -16,6 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"gorm.io/gorm"
 
+	"github.com/FacePhys/Afu-Server-demo/internal/anomaly"
 	"github.com/FacePhys/Afu-Server-demo/internal/billing"
 	"github.com/FacePhys/Afu-Server-demo/internal/config"
 	"github.com/FacePhys/Afu-Server-demo/internal/console"
@@ -23,7 +24,6 @@ import (
 	"github.com/FacePhys/Afu-Server-demo/internal/keystore"
 	"github.com/FacePhys/Afu-Server-demo/internal/service"
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
-	"github.com/FacePhys/Afu-Server-demo/internal/violation"
 	"github.com/FacePhys/Afu-Server-demo/web"
 )
 
@@ -62,36 +62,22 @@ func run(cfgPath string) error {
 	}
 	defer sqlDB.Close()
 
-	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer stop()
-
-	// 违规次数的缓存：启动时把 MySQL 里的违规记录全量同步到 Redis，之后定期检查、出错时重建；没配置时直接查库
-	var cache violation.Cache
-	if cfg.Redis.Addr != "" {
-		rc := violation.NewRedisCache(cfg.Redis, db, log)
-		defer rc.Close()
-		rc.Load(ctx)
-		go rc.Run(ctx)
-		cache = rc
-	} else {
-		log.Info("redis.addr is empty, violation counts are read from MySQL")
-	}
-
-	svc := service.New(db, billing.KeyBilling{DB: db}, billing.LogNotifier{Log: log}, violation.New(db, cache), cfg.Meter, log)
+	anomalies := anomaly.New(db, log) // 异常清单：只记录，不影响处理
+	svc := service.New(db, billing.KeyBilling{DB: db}, billing.LogNotifier{Log: log}, anomalies, cfg.Meter, log)
 
 	if os.Getenv(gin.EnvGinMode) == "" {
 		gin.SetMode(gin.ReleaseMode)
 	}
 	servers := []*http.Server{{
 		Addr:              cfg.Server.Addr,
-		Handler:           handler.New(svc, keys, cfg.Server.MaxBodyBytes, log).Router(),
+		Handler:           handler.New(svc, keys, anomalies, cfg.Server.MaxBodyBytes, log).Router(),
 		ReadHeaderTimeout: cfg.Server.ReadTimeout,
 		ReadTimeout:       cfg.Server.ReadTimeout,
 		WriteTimeout:      cfg.Server.WriteTimeout,
 		IdleTimeout:       60 * time.Second,
 	}}
 	if cfg.Admin.Addr != "" {
-		adminSrv, closeAdminDB, err := newAdminServer(cfg, db, cache, log)
+		adminSrv, closeAdminDB, err := newAdminServer(cfg, db, log)
 		if err != nil {
 			return err
 		}
@@ -99,6 +85,8 @@ func run(cfgPath string) error {
 		servers = append(servers, adminSrv)
 	}
 
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
 	errCh := make(chan error, len(servers))
 	for _, srv := range servers {
 		go func() {
@@ -127,8 +115,8 @@ func run(cfgPath string) error {
 	return runErr
 }
 
-// newAdminServer 创建内部数据后台；配置了 admin.db_dsn 时用单独的连接(违规清零要写 install_violations)。
-func newAdminServer(cfg *config.Config, mainDB *gorm.DB, cache violation.Cache, log *slog.Logger) (*http.Server, func(), error) {
+// newAdminServer 创建内部数据后台；配置了 admin.db_dsn 时用单独的(只读)连接。
+func newAdminServer(cfg *config.Config, mainDB *gorm.DB, log *slog.Logger) (*http.Server, func(), error) {
 	db, closeDB := mainDB, func() {}
 	if cfg.Admin.DBDSN != "" {
 		adminDB, err := store.Open(config.DBConfig{DSN: cfg.Admin.DBDSN, MaxOpenConns: 10, MaxIdleConns: 2}, log)
@@ -148,8 +136,7 @@ func newAdminServer(cfg *config.Config, mainDB *gorm.DB, cache violation.Cache, 
 			kids = append(kids, k.Kid)
 		}
 	}
-	consoleLog := log.With("component", "console")
-	cs, err := console.New(db, violation.New(db, cache), cfg.Admin, cfg.Meter, kids, web.Dist(), consoleLog)
+	cs, err := console.New(db, cfg.Admin, cfg.Meter, kids, web.Dist(), log.With("component", "console"))
 	if err != nil {
 		closeDB()
 		return nil, nil, err

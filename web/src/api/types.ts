@@ -61,22 +61,8 @@ export interface Install {
   reset_reason: string
   confirmed_seq: number
   counters: Counters
-  violations: Violations
   created_at: string
   updated_at: string
-}
-
-/** 设备的违规情况：计次记录 start_ts > end_ts 算一次违规，达到 App Key 的违规上限后停发(cap_runs 为0) */
-export interface Violations {
-  count: number // 当前违规次数，清零后重新累计
-  total: number // 历史累计，清零不变
-  limit: number // 安装记录的 App Key 的违规上限，0为不限
-  stopped: boolean // 达到上限，回复的 cap_runs 为0
-  last_seq: number
-  last_no: number
-  last_at: string | null
-  reset_by: string
-  reset_at: string | null
 }
 
 /** 上报明文里的一条计次记录 */
@@ -111,7 +97,6 @@ export interface AppKey {
   overdraft_limit: number // 透支额度
   used_count: number // 累计计费的计次
   offline_runs: number // 离线可用次数：从已确认往后还能新增几次计次，cap_runs 直接下发
-  max_violations: number // 违规上限：设备违规次数达到后停发；0为不限
   billing_state: 'free' | 'normal' | 'overdraft' | 'exhausted'
   created_by: string
   created_at: string
@@ -135,4 +120,31 @@ export interface LedgerEntry {
   operator: string
   remark: string
   created_at: string
+}
+
+/** 异常清单的一行：同一台设备的同一类异常，次数累加，详情是最近一次的 */
+export interface Anomaly {
+  id: number
+  kind: string // 见 utils/format.ts 的 ANOMALY_KIND_LABEL
+  install_id: string // 请求里的编号格式不对时为空
+  related_id: string // 换号的新编号
+  app_key: string
+  platform: string
+  sdk: string
+  seq: number // 最近一次所在的上报
+  detail: string // 最近一次的详情
+  count: number // 累计次数
+  first_at: string
+  last_at: string
+}
+
+/** 一类异常的统计：涉及几台设备、一共几次 */
+export interface AnomalyKind {
+  kind: string
+  installs: number
+  count: number
+}
+
+export interface AnomalyKinds {
+  kinds: AnomalyKind[]
 }

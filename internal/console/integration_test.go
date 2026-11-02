@@ -18,7 +18,6 @@ import (
 	"github.com/FacePhys/Afu-Server-demo/internal/config"
 	"github.com/FacePhys/Afu-Server-demo/internal/protocol"
 	"github.com/FacePhys/Afu-Server-demo/internal/store"
-	"github.com/FacePhys/Afu-Server-demo/internal/violation"
 )
 
 // 集成测试连真实MySQL：AFU_TEST_DSN 指向专用测试库，测试会清空三张表。
@@ -53,7 +52,7 @@ func setupDB(t *testing.T) *gorm.DB {
 	if err := store.ApplyMigrations(db, "../../migrations"); err != nil {
 		t.Fatal(err)
 	}
-	for _, table := range []string{"installs", "reports", "measurements", "app_keys", "billing_ledger", "install_violations"} {
+	for _, table := range []string{"installs", "reports", "measurements", "app_keys", "billing_ledger", "anomalies"} {
 		if err := db.Exec("TRUNCATE TABLE " + table).Error; err != nil {
 			t.Fatal(err)
 		}
@@ -97,7 +96,7 @@ func setupServer(t *testing.T) (http.Handler, *gorm.DB) {
 	db := setupDB(t)
 	seed(t, db)
 	s := newTestServer(t, fstest.MapFS{})
-	s.db, s.violations = db, violation.New(db, nil)
+	s.db = db
 	s.now = func() time.Time { return utc("2026-10-26T04:00:00Z") } // 北京时间10-26 12:00
 	return s.Router(), db
 }
@@ -428,84 +427,69 @@ func TestIntegrationReportCharge(t *testing.T) {
 	}
 }
 
-func TestIntegrationViolations(t *testing.T) {
+func TestIntegrationAnomalies(t *testing.T) {
 	h, db := setupServer(t)
-	// A、B 用 AK1(违规上限3)，C 用 AK2(不限)；A 违规3次(停发)，C 违规1次
-	for _, k := range []store.AppKey{{AppKey: "AK1", Status: store.AppKeyEnabled, MaxViolations: 3}, {AppKey: "AK2", Status: store.AppKeyEnabled}} {
-		if err := db.Create(&k).Error; err != nil {
-			t.Fatal(err)
-		}
+	rows := []store.Anomaly{
+		{Kind: "time_reversed", InstallID: idA, AppKey: "AK1", Platform: "android", Count: 3, Detail: "本次 1 条",
+			FirstAt: utc("2026-10-25T16:00:00Z"), LastAt: utc("2026-10-26T02:00:00Z")},
+		{Kind: "bad_payload", InstallID: idB, AppKey: "AK1", Platform: "ios", Count: 5, Seq: 9, Detail: "上报：invalid payload: measurements[0] no=0",
+			FirstAt: utc("2026-10-26T03:00:00Z"), LastAt: utc("2026-10-26T03:00:00Z")},
+		{Kind: "reassign_conflict", InstallID: idC, RelatedID: idA, AppKey: "AK2", Platform: "android", Count: 2,
+			FirstAt: utc("2026-10-24T10:00:00Z"), LastAt: utc("2026-10-24T11:00:00Z")},
+		{Kind: "bad_payload", InstallID: "", Count: 7, Detail: "注册：unexpected end of JSON input", // 编号不合法的合成一行
+			FirstAt: utc("2026-10-25T20:00:00Z"), LastAt: utc("2026-10-26T01:00:00Z")},
 	}
-	lastAt := utc("2026-10-26T03:00:00Z")
-	for _, v := range []store.InstallViolation{{InstallID: idA, Count: 3, Total: 3, LastSeq: 2, LastNo: 2, LastAt: &lastAt}, {InstallID: idC, Count: 1, Total: 1}} {
-		if err := db.Create(&v).Error; err != nil {
-			t.Fatal(err)
+	if err := db.Create(&rows).Error; err != nil {
+		t.Fatal(err)
+	}
+	key := func(a Anomaly) string { return a.Kind + "/" + a.InstallID }
+	list := func(q string) []string {
+		t.Helper()
+		var out []string
+		for _, a := range getJSON[Page[Anomaly]](t, h, api+"/anomalies?"+q).Items {
+			out = append(out, key(a))
+		}
+		return out
+	}
+
+	// 默认按最近发生时间倒序
+	p := getJSON[Page[Anomaly]](t, h, api+"/anomalies")
+	if p.Total != 4 || len(p.Items) != 4 || key(p.Items[0]) != "bad_payload/"+idB || p.Items[0].Count != 5 || p.Items[0].Seq != 9 ||
+		!p.Items[0].LastAt.Equal(utc("2026-10-26T03:00:00Z")) || key(p.Items[3]) != "reassign_conflict/"+idC {
+		t.Fatalf("列表 = %+v", p)
+	}
+	cases := map[string][]string{
+		"kind=bad_payload":                    {"bad_payload/" + idB, "bad_payload/"},
+		"install_id=" + idA:                   {"time_reversed/" + idA, "reassign_conflict/" + idC}, // 换号后的编号也能查到
+		"platform=ios":                        {"bad_payload/" + idB},
+		"app_key=AK2":                         {"reassign_conflict/" + idC},
+		"from=2026-10-26T00:00:00%2B08:00":    {"bad_payload/" + idB, "time_reversed/" + idA, "bad_payload/"},
+		"to=2026-10-25T00:00:00%2B08:00":      {"reassign_conflict/" + idC}, // 首次 ~ 最近 和区间有交集
+		"kind=time_reversed&platform=ios":     nil,
+		"kind=bad_payload&page_size=1&page=2": {"bad_payload/"},
+	}
+	for q, want := range cases {
+		if got := list(q); strings.Join(got, ",") != strings.Join(want, ",") {
+			t.Fatalf("%s: got %v, want %v", q, got, want)
 		}
 	}
 
-	list := getJSON[Page[Install]](t, h, api+"/installs")
-	got := map[string]Violations{}
-	for _, it := range list.Items {
-		got[it.InstallID] = it.Violations
+	// 按类型统计：设备数、次数；筛选条件同列表(不含类型)
+	k := getJSON[AnomalyKinds](t, h, api+"/anomalies/kinds")
+	if len(k.Kinds) != 3 || k.Kinds[0] != (AnomalyKind{"bad_payload", 2, 12}) || k.Kinds[1] != (AnomalyKind{"reassign_conflict", 1, 2}) ||
+		k.Kinds[2] != (AnomalyKind{"time_reversed", 1, 3}) {
+		t.Fatalf("按类型统计 = %+v", k.Kinds)
 	}
-	if a := got[idA]; a.Count != 3 || a.Total != 3 || a.Limit != 3 || !a.Stopped || a.LastSeq != 2 || a.LastAt == nil || !a.LastAt.Equal(lastAt) {
-		t.Fatalf("A = %+v", a)
+	if k := getJSON[AnomalyKinds](t, h, api+"/anomalies/kinds?platform=android"); len(k.Kinds) != 2 || k.Kinds[0].Kind != "reassign_conflict" {
+		t.Fatalf("按平台筛选后统计 = %+v", k.Kinds)
 	}
-	if c := got[idC]; c.Count != 1 || c.Limit != 0 || c.Stopped {
-		t.Fatalf("C(不限) = %+v", c)
-	}
-	if b := got[idB]; b != (Violations{Limit: 3}) {
-		t.Fatalf("B(没有违规) = %+v", b)
-	}
-	for q, want := range map[string]string{"violation=any": idC + "," + idA, "violation=stopped": idA} {
-		var ids []string
-		for _, it := range getJSON[Page[Install]](t, h, api+"/installs?"+q).Items {
-			ids = append(ids, it.InstallID)
-		}
-		if strings.Join(ids, ",") != want {
-			t.Fatalf("%s: %v", q, ids)
-		}
-	}
-	if w := get(t, h, api+"/installs?violation=x", testToken); w.Code != http.StatusBadRequest {
-		t.Fatalf("非法筛选: %d", w.Code)
+	if k := getJSON[AnomalyKinds](t, h, api+"/anomalies/kinds?app_key=none"); k.Kinds == nil || len(k.Kinds) != 0 {
+		t.Fatalf("没有异常时返回空数组 = %+v", k)
 	}
 
-	// 清零：次数归0、历史累计不变、记操作人，恢复下发
-	w := send(t, h, http.MethodPost, api+"/installs/"+idA+"/violations/reset", "")
-	var reset Install
-	json.Unmarshal(w.Body.Bytes(), &reset)
-	if v := reset.Violations; w.Code != http.StatusOK || v.Count != 0 || v.Total != 3 || v.Stopped || v.ResetBy != "alice" || v.ResetAt == nil {
-		t.Fatalf("清零: %d %s", w.Code, w.Body)
-	}
-	if d := getJSON[Install](t, h, api+"/installs/"+idA); d.Violations.Count != 0 || d.Violations.Stopped {
-		t.Fatalf("清零后详情 = %+v", d.Violations)
-	}
-	if w := send(t, h, http.MethodPost, api+"/installs/"+idB+"/violations/reset", ""); w.Code != http.StatusOK {
-		t.Fatalf("没有违规也能清零(什么也不做): %d %s", w.Code, w.Body)
-	}
-	if w := send(t, h, http.MethodPost, api+"/installs/dddddddddddddddddddddddddddddddd/violations/reset", ""); w.Code != http.StatusNotFound {
-		t.Fatalf("不存在的编号: %d", w.Code)
-	}
-
-	// App Key 的违规上限：默认3，可以改，最大1000，0为不限
-	const base = api + "/app-keys"
-	var k AppKey
-	w = send(t, h, http.MethodPost, base, `{"remark":"违规"}`)
-	json.Unmarshal(w.Body.Bytes(), &k)
-	if w.Code != http.StatusCreated || k.MaxViolations != store.DefaultMaxViolations {
-		t.Fatalf("默认上限: %d %s", w.Code, w.Body)
-	}
-	w = send(t, h, http.MethodPatch, base+"/"+itoa(k.ID), `{"max_violations":0}`)
-	json.Unmarshal(w.Body.Bytes(), &k)
-	if w.Code != http.StatusOK || k.MaxViolations != 0 {
-		t.Fatalf("改成不限: %d %s", w.Code, w.Body)
-	}
-	for _, body := range []string{`{"max_violations":1001}`, `{"max_violations":-1}`} {
-		if w := send(t, h, http.MethodPatch, base+"/"+itoa(k.ID), body); w.Code != http.StatusBadRequest {
-			t.Fatalf("%s: %d", body, w.Code)
+	for _, path := range []string{"/anomalies?kind=x", "/anomalies?install_id=short", "/anomalies?platform=web", "/anomalies/kinds?from=x"} {
+		if w := get(t, h, api+path, testToken); w.Code != http.StatusBadRequest {
+			t.Fatalf("%s: %d", path, w.Code)
 		}
-	}
-	if w := send(t, h, http.MethodPost, base, `{"max_violations":1001}`); w.Code != http.StatusBadRequest {
-		t.Fatalf("创建时超过上限: %d", w.Code)
 	}
 }

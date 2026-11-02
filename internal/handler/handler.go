@@ -11,6 +11,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 
+	"github.com/FacePhys/Afu-Server-demo/internal/anomaly"
 	"github.com/FacePhys/Afu-Server-demo/internal/envelope"
 	"github.com/FacePhys/Afu-Server-demo/internal/protocol"
 )
@@ -25,15 +26,21 @@ type KeyStore interface {
 	Get(kid int) (*rsa.PrivateKey, bool)
 }
 
-type Handler struct {
-	svc     Service
-	keys    KeyStore
-	maxBody int64
-	log     *slog.Logger
+// Recorder 记异常清单，见 internal/anomaly；只是记录，不影响处理。
+type Recorder interface {
+	Record(ctx context.Context, e anomaly.Event)
 }
 
-func New(svc Service, keys KeyStore, maxBody int64, log *slog.Logger) *Handler {
-	return &Handler{svc: svc, keys: keys, maxBody: maxBody, log: log}
+type Handler struct {
+	svc       Service
+	keys      KeyStore
+	anomalies Recorder
+	maxBody   int64
+	log       *slog.Logger
+}
+
+func New(svc Service, keys KeyStore, anomalies Recorder, maxBody int64, log *slog.Logger) *Handler {
+	return &Handler{svc: svc, keys: keys, anomalies: anomalies, maxBody: maxBody, log: log}
 }
 
 // MeterPath 是SDK上报的唯一入口，所有接口统一带 /afu 前缀。
@@ -82,7 +89,7 @@ func (h *Handler) Meter(c *gin.Context) {
 	case protocol.TypeRegister:
 		var req protocol.RegisterReq
 		if err := protocol.DecodeAndValidate(plain, &req); err != nil {
-			h.badPayload(c, req.InstallID, 0, err)
+			h.badPayload(c, anomaly.Event{InstallID: req.InstallID, AppKey: req.AppKey, Platform: req.Platform, SDK: req.SDK}, err)
 			return
 		}
 		f.installID = req.InstallID
@@ -90,7 +97,7 @@ func (h *Handler) Meter(c *gin.Context) {
 	case protocol.TypeReport:
 		var req protocol.ReportReq
 		if err := protocol.DecodeAndValidate(plain, &req); err != nil {
-			h.badPayload(c, req.InstallID, req.Seq, err)
+			h.badPayload(c, anomaly.Event{InstallID: req.InstallID, AppKey: req.AppKey, Platform: req.Platform, SDK: req.SDK, Seq: req.Seq}, err)
 			return
 		}
 		f.installID, f.seq = req.InstallID, req.Seq
@@ -115,15 +122,17 @@ func (h *Handler) Meter(c *gin.Context) {
 	c.JSON(http.StatusOK, protocol.RespEnvelope{V: *env.V, Type: respType, CT: ct})
 }
 
-// badPayload 明文不合法：具体原因(哪个字段、取值，不含明文)记一条 WARN 日志，客户端照常只收到 bad_payload。
-// install_id 格式正确时也写进访问日志，方便找到是哪台设备；格式不对的编号在原因里。
-func (h *Handler) badPayload(c *gin.Context, installID string, seq uint64, err error) {
+// badPayload 明文不合法：具体原因(哪个字段、取值，不含明文)记一条 WARN 日志、记进异常清单，客户端照常只收到 bad_payload。
+// e 带上解析出来的设备、app_key、平台、sdk、seq(可能不全)；install_id 格式正确时也写进访问日志，格式不对的编号在原因里。
+func (h *Handler) badPayload(c *gin.Context, e anomaly.Event, err error) {
 	f := fields(c)
-	if protocol.IsInstallID(installID) {
-		f.installID = installID
+	if protocol.IsInstallID(e.InstallID) {
+		f.installID = e.InstallID
 	}
-	f.seq = seq
+	f.seq = e.Seq
 	h.log.Warn("bad payload", "type", f.typ, "kid", f.kid, "install_id", f.installID, "seq", f.seq, "reason", err.Error())
+	e.Kind, e.Detail = anomaly.KindBadPayload, anomaly.RequestLabel(f.typ)+"："+err.Error()
+	h.anomalies.Record(c.Request.Context(), e)
 	h.fail(c, err)
 }
 
